@@ -1,0 +1,25 @@
+# Pick a specific tag once you settle on an EnergyPlus version
+FROM nrel/energyplus:latest
+
+USER root
+
+# Python + deps for your script
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3 python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir numpy
+
+# EnergyPlus install dir varies by tag; this glob usually works in nrel images
+# We'll set PYTHONPATH at runtime in entrypoint to be safe.
+
+WORKDIR /app
+COPY run_sim_base.py /app/run_sim_base.py
+
+# Create the paths your script expects
+RUN mkdir -p /home/guser/weather /home/guser/models /home/guser/results
+
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+ENTRYPOINT ["/app/entrypoint.sh"]
