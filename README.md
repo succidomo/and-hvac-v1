@@ -18,10 +18,7 @@ docker run --rm --name eplus-test -v "${PWD}\results:/home/guser/results" eplus-
 ### Smoke test docker file 
 '''
 docker build -t andruix/eplus:latest -f Dockerfile .
-docker run --rm -it -v "$(pwd)/shared:/shared" andruix/eplus:latest \
-  --rollout-id smoke-001 \
-  --out-dir /shared/rollouts/inbox/smoke-001 \
-  --start-mmdd 06/10 --end-mmdd 06/17 \
-  --seed 123
+
+docker run --rm -it -v "$(pwd)/shared:/shared" andruix/eplus:latest --rollout-id smoke-001 --outdir /shared/results/smoke-001 --rollout-dir /shared/rollouts/inbox/smoke-001 --start-date 06/10 --end-date 06/17 
 '''
 
