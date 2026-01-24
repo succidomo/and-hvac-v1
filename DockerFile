@@ -9,11 +9,16 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir numpy
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch
 
 WORKDIR /app
 
 # Your script
-COPY run_sim_base.py /app/run_sim_base.py
+COPY run_sim_train.py /app/run_sim_train.py
+COPY eplus_runperiod_utils.py /app/eplus_runperiod_utils.py
+COPY andruix_policy_model.py /app/andruix_policy_model.py
+COPY andruix_rollout_writer.py /app/andruix_rollout_writer.py
+COPY andruix_simple_model.py /app/andruix_simple_model.py
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh && sed -i 's/\r$//' /app/entrypoint.sh
 

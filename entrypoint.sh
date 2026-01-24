@@ -29,4 +29,4 @@ export LD_LIBRARY_PATH="${EPLUS_DIR}:${LD_LIBRARY_PATH:-}"
 
 echo "PYTHONPATH: ${PYTHONPATH}"
 echo "Running python..."
-python3 /app/run_sim_base.py "$@"
+python3 /app/run_sim_train.py "$@"
