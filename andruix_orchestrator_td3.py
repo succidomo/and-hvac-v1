@@ -54,6 +54,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch.utils.tensorboard import SummaryWriter
+
 
 # -----------------------------
 # Paths / layout helpers
@@ -364,8 +366,7 @@ def docker_run_worker(spec: WorkerSpec) -> str:
         "--outdir", f"/shared/results/{spec.rollout_id}",
         "--start-date", spec.extra_env["ANDRUIX_START_MMDD"],
         "--end-date", spec.extra_env["ANDRUIX_END_MMDD"],
-        "--idf", "/shared/models/IECC_OfficeMedium...idf",
-        "--epw", "/shared/weather/Denver.epw",
+        "--policy-kind", spec.extra_env.get("ANDRUIX_POLICY_KIND", "simple"),
     ]
 
 
@@ -452,6 +453,9 @@ class Orchestrator:
         worker_cpus: Optional[float] = None,
         worker_mem: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        tb_logdir: Optional[Path] = None,
+        tb_run_name: Optional[str] = None,
+        tb_flush_secs: int = 10
     ):
         self.shared_root = shared_root
         self.paths = ensure_dirs(shared_root)
@@ -468,6 +472,27 @@ class Orchestrator:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.learner = TD3Learner(obs_dim, act_dim, cfg, self.device)
         self.rb = ReplayBuffer(obs_dim, act_dim, capacity=2_000_000)
+
+        # TensorBoard
+        run_name = tb_run_name or time.strftime('%Y%m%d_%H%M%S')
+        logdir = (tb_logdir or (self.shared_root / 'tb')) / run_name
+        logdir.mkdir(parents=True, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=str(logdir), flush_secs=int(tb_flush_secs))
+        self.tb_logdir = logdir
+        # Log static run config
+        self.writer.add_text('run/config', json.dumps({
+            'image': self.image,
+            'obs_dim': obs_dim,
+            'act_dim': act_dim,
+            'max_workers': self.max_workers,
+            'rollout_days': self.rollout_days,
+            'train_steps_per_rollout': self.train_steps_per_rollout,
+            'publish_every_rollouts': self.publish_every_rollouts,
+            'min_replay_before_train': self.min_replay_before_train,
+            'td3_cfg': self.learner.cfg.__dict__,
+            'extra_env': self.extra_env,
+        }, indent=2))
+        self.writer.add_text('run/logdir', str(self.tb_logdir))
 
         self.active: Dict[str, str] = {}  # rollout_id -> container_id
         self.rollouts_ingested = 0
@@ -495,6 +520,13 @@ class Orchestrator:
             "act_limit": self.learner.cfg.act_limit,
         }
         atomic_save_torch(obj, policy_path)
+
+        # TensorBoard
+        if self.writer is not None:
+            self.writer.add_scalar('policy/published', 1, self.rollouts_ingested)
+            self.writer.add_scalar('policy/total_updates', self.learner.total_updates, self.rollouts_ingested)
+            if version_note:
+                self.writer.add_text('policy/note', version_note, self.rollouts_ingested)
 
         # Optional: also write a small JSON sidecar for human debugging
         with open(self.paths["policy_dir"] / "policy_meta.json.tmp", "w", encoding="utf-8") as f:
@@ -557,6 +589,15 @@ class Orchestrator:
                 ingested += 1
                 self.rollouts_ingested += 1
                 print(f"[orchestrator] ingested rollout={rdir.name} transitions={added} buffer_size={self.rb.size}")
+                # TensorBoard rollout metrics
+                if self.writer is not None:
+                    ep_return = float(np.sum(rew))
+                    self.writer.add_scalar('rollout/transitions', int(added), self.rollouts_ingested)
+                    self.writer.add_scalar('rollout/episode_return', ep_return, self.rollouts_ingested)
+                    self.writer.add_scalar('rollout/mean_reward', float(np.mean(rew)), self.rollouts_ingested)
+                    self.writer.add_scalar('rollout/min_reward', float(np.min(rew)), self.rollouts_ingested)
+                    self.writer.add_scalar('rollout/max_reward', float(np.max(rew)), self.rollouts_ingested)
+                    self.writer.add_scalar('buffer/size', int(self.rb.size), self.rollouts_ingested)
             except Exception as e:
                 print(f"[orchestrator] ERROR ingesting {rdir}: {e}")
                 # move aside for inspection
@@ -583,6 +624,12 @@ class Orchestrator:
             f"q_loss={metrics['q_loss']:.4f} actor_loss={metrics['actor_loss']:.4f} device={self.device}"
         )
 
+        # TensorBoard training metrics (x-axis: total_updates)
+        if self.writer is not None:
+            self.writer.add_scalar('train/q_loss', metrics['q_loss'], self.learner.total_updates)
+            self.writer.add_scalar('train/actor_loss', metrics['actor_loss'], self.learner.total_updates)
+            self.writer.add_scalar('train/steps_this_update', int(steps), self.learner.total_updates)
+
         if self.publish_every_rollouts > 0 and (self.rollouts_ingested % self.publish_every_rollouts == 0):
             self.publish_policy(version_note=f"rollouts={self.rollouts_ingested}")
 
@@ -593,6 +640,10 @@ class Orchestrator:
             print(f"[orchestrator] stopping rollout {rid} cid={cid}")
             docker_stop(cid, timeout_s=10)
         self.active.clear()
+
+        if hasattr(self, 'writer') and self.writer is not None:
+            self.writer.flush()
+            self.writer.close()
 
     def run_forever(self, poll_s: float = 2.0) -> None:
         def _sig_handler(signum, frame):
@@ -619,6 +670,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--shared-root", type=str, required=True, help="Host directory shared with containers, e.g. /data/andruix")
     p.add_argument("--image", type=str, required=True, help="Rollout worker docker image, e.g. andruix/eplus:latest")
+
+    # TensorBoard
+    p.add_argument('--tb-logdir', type=str, default=None, help='TensorBoard log root (default: <shared-root>/tb)')
+    p.add_argument('--tb-run-name', type=str, default=None, help='TensorBoard run name (default: timestamp)')
+    p.add_argument('--tb-flush-secs', type=int, default=10, help='TensorBoard flush seconds')
 
     # You must set these to match your environment
     p.add_argument("--obs-dim", type=int, required=True)
@@ -688,6 +744,9 @@ def main() -> int:
         worker_cpus=args.worker_cpus,
         worker_mem=args.worker_mem,
         extra_env=extra_env,
+        tb_logdir=(Path(args.tb_logdir).resolve() if args.tb_logdir else None),
+        tb_run_name=args.tb_run_name,
+        tb_flush_secs=args.tb_flush_secs
     )
     orch.run_forever(poll_s=2.0)
     return 0
