@@ -367,6 +367,8 @@ def docker_run_worker(spec: WorkerSpec) -> str:
         "--start-date", spec.extra_env["ANDRUIX_START_MMDD"],
         "--end-date", spec.extra_env["ANDRUIX_END_MMDD"],
         "--policy-kind", spec.extra_env.get("ANDRUIX_POLICY_KIND", "simple"),
+        "--reward-mode", spec.extra_env.get("ANDRUIX_REWARD_MODE", "raw"),
+        "--reward-scale", spec.extra_env.get("ANDRUIX_REWARD_SCALE", "3600000"),
     ]
 
 

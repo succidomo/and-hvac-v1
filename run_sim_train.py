@@ -29,6 +29,8 @@ class RLController:
         energy_meter_name: str = "Electricity:Building",
         dump_api_available_csv: bool = True,
         debug_meter_every_n_steps: int = 20,
+        reward_mode: str = "delta",
+        reward_scale: float = 1e6,
     ):
         self.api = api
         self.state = state
@@ -44,6 +46,9 @@ class RLController:
 
         self.dump_api_available_csv = dump_api_available_csv
         self.debug_meter_every_n_steps = debug_meter_every_n_steps
+
+        self.reward_mode = (reward_mode or "delta").lower()
+        self.reward_scale = float(reward_scale) if reward_scale else 1.0
 
         # Worker-side policy (loads once at init, no per-timestep RPC)
         # Default path matches the orchestrator contract: /shared/policy/latest/policy.pt
@@ -233,6 +238,7 @@ class RLController:
         self._prev_day_of_year = doy
         self._prev_minute_of_day = mod
 
+    
     def end_system_timestep_callback(self, state):
         if not self._ensure_ready(state):
             return
@@ -244,9 +250,33 @@ class RLController:
             print("[meter] api_error_flag=True reading meter; handle likely invalid")
             return
 
-        rew = -raw_val
+        # Meter interpretation:
+        # - Many EnergyPlus meters are cumulative over the run. In that case, delta is what you want per step.
+        # - If your chosen meter is already per-timestep, 'raw' may be fine.
+        delta = None
+        if self.last_meter_val is None:
+            delta = 0.0
+        else:
+            delta = float(raw_val) - float(self.last_meter_val)
+            # If meter ever resets/backtracks, clamp to 0 for safety
+            if delta < 0.0:
+                delta = 0.0
+        self.last_meter_val = float(raw_val)
+
+        use_val = float(raw_val) if self.reward_mode == "raw" else float(delta)
+        scale = self.reward_scale if self.reward_scale != 0.0 else 1.0
+        energy_kwh = use_val / scale
+        rew = -energy_kwh
+
+        # Optional debug print
+        # self.step_count += 1
+        # if self.debug_meter_every_n_steps and (self.step_count % self.debug_meter_every_n_steps == 0) and self.reward_mode == "raw":
+        #     print(f"[meter] raw={raw_val:.3f} reward={rew:.6f} mode={self.reward_mode} scale={scale:g}")
+        # elif self.debug_meter_every_n_steps and (self.step_count % self.debug_meter_every_n_steps == 0) and self.reward_mode == "delta":
+        #     print(f"[meter] delta={delta:.3f} reward={rew:.6f} mode={self.reward_mode} scale={scale:g}")
+
         self._pending_rew = rew
-        self._pending_energy = raw_val
+        self._pending_energy = energy_kwh
 
 
     def finalize_and_write_rollout(self):
@@ -326,6 +356,18 @@ def parse_args():
         choices=["simple", "torch"],
         help="Which policy implementation to use on the worker. Use simple for smoke tests.",
     )
+    p.add_argument(
+        "--reward-mode",
+        default=os.environ.get("ANDRUIX_REWARD_MODE", "delta"),
+        choices=["raw", "delta"],
+        help="Reward uses raw meter value ('raw') or per-step delta of the meter ('delta'). Delta is recommended if the meter is cumulative.",
+    )
+    p.add_argument(
+        "--reward-scale",
+        type=float,
+        default=float(os.environ.get("ANDRUIX_REWARD_SCALE", "1000000.0")),
+        help="Divide reward by this scale factor to keep magnitudes reasonable (e.g., 1e6 or 1e9).",
+    )
 
     p.add_argument(
         "--policy-path",
@@ -373,6 +415,8 @@ def main():
         policy_kind=args.policy_kind,
         dump_api_available_csv=args.dump_api_csv,
         debug_meter_every_n_steps=20,
+        reward_mode=args.reward_mode,
+        reward_scale=args.reward_scale,
     )
 
     eplus_args = ["-w", str(epw), "-d", str(outdir), str(idf)]

@@ -19,7 +19,14 @@ docker run --rm --name eplus-test -v "${PWD}\results:/home/guser/results" eplus-
 '''
 docker build -t andruix/eplus:latest -f Dockerfile .
 
-docker run --rm -it -v "$(pwd)/shared:/shared" andruix/eplus:latest --rollout-id smoke-001 --outdir /shared/results/smoke-001 --rollout-dir /shared/rollouts/inbox/smoke-001 --start-date 06/10 --end-date 06/17 
+docker run --rm -it -v "${pwd}\shared:/shared" andruix/eplus:latest `
+  --rollout-id raw-test `
+  --rollout-dir /shared/rollouts/inbox/raw-test `
+  --outdir /shared/results/raw-test `
+  --start-date 06/10 --end-date 06/17 `
+  --policy-kind torch `
+  --reward-mode raw `
+  --reward-scale 3600000
 '''
 
 ### create Shared Folder Once 
@@ -48,7 +55,17 @@ python .\andruix_orchestrator_td3.py `
   --publish-every-rollouts 1 `
   --env ANDRUIX_START_MMDD=06/10 `
   --env ANDRUIX_END_MMDD=06/17 `
-  --env ANDRUIX_POLICY_KIND=torch
+  --env ANDRUIX_POLICY_KIND=torch `
+  --tb-run-name denver_june10_smoke2 `
+  --env ANDRUIX_REWARD_MODE=raw `
+  --env ANDRUIX_REWARD_SCALE=3600000
+
+'''
+
+### Remove Item for old training
+'''
+Remove-Item -Recurse -Force .\shared\rollouts\inbox\* -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force .\shared\rollouts\done\*  -ErrorAction SilentlyContinue
 
 '''
 
