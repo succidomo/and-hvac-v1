@@ -427,12 +427,13 @@ def list_completed_rollouts(inbox_dir: Path) -> List[Path]:
 
 
 def load_traj_npz(traj_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    data = np.load(traj_path)
-    obs = data["obs"]
-    act = data["act"]
-    rew = data["rew"]
-    next_obs = data["next_obs"]
-    done = data["done"]
+    """Load a rollout npz safely (ensures file handle is closed; important on Windows)."""
+    with np.load(traj_path) as data:
+        obs = data["obs"]
+        act = data["act"]
+        rew = data["rew"]
+        next_obs = data["next_obs"]
+        done = data["done"]
     return obs, act, rew, next_obs, done
 
 
