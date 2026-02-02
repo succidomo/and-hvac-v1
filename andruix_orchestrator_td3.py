@@ -53,6 +53,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import hashlib
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -78,6 +79,9 @@ def ensure_dirs(shared_root: Path) -> Dict[str, Path]:
         "logs_dir": logs_dir,
     }
 
+def _sha1(a: np.ndarray) -> str:
+    # stable fingerprint for “are these arrays identical?”
+    return hashlib.sha1(np.ascontiguousarray(a).tobytes()).hexdigest()[:10]
 
 def atomic_save_torch(obj: Dict, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -339,11 +343,11 @@ def docker_run_worker(spec: WorkerSpec) -> str:
         # Worker should read policy from here (inside container)
         "ANDRUIX_POLICY_PATH": "/shared/policy/latest/policy.pt",
         # Worker should write here (inside container)
-        "ANDRUIX_OUT_DIR": f"/shared/rollouts/inbox/{spec.rollout_id}",
+        "ANDRUIX_OUT_DIR": f"/shared/rollouts/inbox/{spec.rollout_id}"
     }
     env.update(spec.extra_env or {})
 
-    cmd = ["docker", "run", "--rm", "-d"]
+    cmd = ["docker", "run", "-d", "--name", f"andruix_rollout_{spec.rollout_id}", "--label", f"andruix.rollout_id={spec.rollout_id}"]
     # Resource caps (optional)
     if spec.cpus is not None:
         cmd += ["--cpus", str(spec.cpus)]
@@ -366,7 +370,7 @@ def docker_run_worker(spec: WorkerSpec) -> str:
         "--outdir", f"/shared/results/{spec.rollout_id}",
         "--start-date", spec.extra_env["ANDRUIX_START_MMDD"],
         "--end-date", spec.extra_env["ANDRUIX_END_MMDD"],
-        "--policy-kind", spec.extra_env.get("ANDRUIX_POLICY_KIND", "simple"),
+        "--policy-kind", spec.extra_env.get("ANDRUIX_POLICY_KIND", "torch"),
         "--reward-mode", spec.extra_env.get("ANDRUIX_REWARD_MODE", "raw"),
         "--reward-scale", spec.extra_env.get("ANDRUIX_REWARD_SCALE", "3600000"),
     ]
@@ -402,6 +406,20 @@ def docker_stop(container_id: str, timeout_s: int = 10) -> None:
         # might already be stopped
         pass
 
+
+def docker_get_logs(container_id: str) -> str:
+    """Return docker logs for a container (stdout+stderr). Container must still exist."""
+    try:
+        return subprocess.check_output(["docker", "logs", container_id], stderr=subprocess.STDOUT, text=True)
+    except subprocess.CalledProcessError as e:
+        return e.output or ""
+
+def docker_rm(container_id: str) -> None:
+    """Remove a stopped container."""
+    try:
+        subprocess.check_call(["docker", "rm", "-f", container_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        pass
 
 # -----------------------------
 # Rollout ingestion
@@ -555,14 +573,34 @@ class Orchestrator:
             self.active[rollout_id] = cid
             print(f"[orchestrator] launched rollout {rollout_id} -> container {cid}")
 
+    
     def reap_finished_containers(self) -> None:
-        # Not strictly required if you rely on DONE markers, but useful for visibility.
+        """Capture logs for finished containers and remove them."""
         dead = []
         for rid, cid in self.active.items():
             if not docker_ps(cid):
                 dead.append(rid)
+
         for rid in dead:
             cid = self.active.pop(rid, "")
+            # Capture docker logs BEFORE removing container
+            try:
+                logs_text = docker_get_logs(cid)
+                log_path = self.paths["logs_dir"] / f"worker_{rid}.log"
+                header = (
+                    f"===== Andruix worker logs ====="
+                    f"rollout_id: {rid}"
+                    f"container_id: {cid}"
+                    f"captured_at_unix: {time.time()}"
+                    f"==============================="
+                )
+                log_path.write_text(header + logs_text, encoding="utf-8")
+                print(f"[orchestrator] wrote worker logs -> {log_path}")
+            except Exception as e:
+                print(f"[orchestrator] WARNING: failed to capture logs for rollout {rid} cid={cid}: {e}")
+
+            # Remove container (we intentionally do NOT use --rm so we can capture logs)
+            docker_rm(cid)
             print(f"[orchestrator] container ended for rollout {rid} (cid={cid})")
 
     def ingest_completed_rollouts(self) -> int:
@@ -588,10 +626,44 @@ class Orchestrator:
 
             try:
                 obs, act, rew, next_obs, done = load_traj_npz(npz_path)
+
+                # act debug delete me later
+                act_mean = float(np.mean(act))
+                act_std  = float(np.std(act))
+                act_min  = float(np.min(act))
+                act_max  = float(np.max(act))
+
+                rew_sha = _sha1(rew)
+                act_sha = _sha1(act)
+
+                print(
+                    f"[orchestrator] rollout={rdir.name} "
+                    f"act(mean={act_mean:.4f}, std={act_std:.4f}, min={act_min:.4f}, max={act_max:.4f}) "
+                    f"sha(rew={rew_sha}, act={act_sha})"
+                )
+                # act debug delete me later
+
                 added = self.rb.add_batch(obs, act, rew, next_obs, done)
                 ingested += 1
                 self.rollouts_ingested += 1
-                print(f"[orchestrator] ingested rollout={rdir.name} transitions={added} buffer_size={self.rb.size}")
+
+                # Reward statistics for debugging ingestion
+                rew_arr = np.asarray(rew, dtype=np.float32)
+                nan_ct = int(np.isnan(rew_arr).sum())
+                if nan_ct:
+                    print(f"[orchestrator] WARNING: rollout={rdir.name} has {nan_ct} NaN rewards")
+                rew_mean = float(np.nanmean(rew_arr))
+                rew_std = float(np.nanstd(rew_arr))
+                rew_min = float(np.nanmin(rew_arr))
+                rew_max = float(np.nanmax(rew_arr))
+                rew_sum = float(np.nansum(rew_arr))
+                nsteps = int(rew_arr.shape[0])
+                print(
+                    f"[orchestrator] ingested rollout={rdir.name} transitions={added} buffer_size={self.rb.size} "
+                    f"steps={nsteps} return={rew_sum:.4f} mean={rew_mean:.6f} std={rew_std:.6f} "
+                    f"min={rew_min:.6f} max={rew_max:.6f} npz={npz_path.name}"
+                )
+
                 # TensorBoard rollout metrics
                 if self.writer is not None:
                     ep_return = float(np.sum(rew))
@@ -639,14 +711,50 @@ class Orchestrator:
     def stop(self) -> None:
         self._stop = True
         print("[orchestrator] stopping... stopping active containers")
+
+        # Stop and capture logs for any active containers
         for rid, cid in list(self.active.items()):
             print(f"[orchestrator] stopping rollout {rid} cid={cid}")
-            docker_stop(cid, timeout_s=10)
+
+            # Stop container (best-effort)
+            try:
+                docker_stop(cid, timeout_s=10)
+            except Exception as e:
+                print(f"[orchestrator] WARNING: docker_stop failed rid={rid} cid={cid}: {e}")
+
+            # Capture logs (best-effort)
+            try:
+                logs_text = docker_get_logs(cid)
+                log_path = self.paths["logs_dir"] / f"worker_{rid}.log"
+                header = (
+                    "===== Andruix worker logs (stopped) =====\n"
+                    f"rollout_id: {rid}\n"
+                    f"container_id: {cid}\n"
+                    f"captured_at_unix: {time.time()}\n"
+                    "========================================\n"
+                )
+                log_path.write_text(header + logs_text, encoding="utf-8")
+                print(f"[orchestrator] wrote worker logs -> {log_path}")
+            except Exception as e:
+                print(f"[orchestrator] WARNING: failed to capture logs rid={rid} cid={cid}: {e}")
+
+            # Remove container (best-effort)
+            try:
+                docker_rm(cid)
+            except Exception as e:
+                print(f"[orchestrator] WARNING: docker_rm failed rid={rid} cid={cid}: {e}")
+
+        # Clear after loop
         self.active.clear()
 
-        if hasattr(self, 'writer') and self.writer is not None:
-            self.writer.flush()
-            self.writer.close()
+        # Flush TB writer
+        if hasattr(self, "writer") and self.writer is not None:
+            try:
+                self.writer.flush()
+                self.writer.close()
+            except Exception as e:
+                print(f"[orchestrator] WARNING: failed to close writer: {e}")
+
 
     def run_forever(self, poll_s: float = 2.0) -> None:
         def _sig_handler(signum, frame):

@@ -45,9 +45,9 @@ docker build -t andruix/eplus:latest -f Dockerfile .
 python .\andruix_orchestrator_td3.py `
   --shared-root .\shared `
   --image andruix/eplus:latest `
-  --obs-dim 2 `
+  --obs-dim 11 `
   --act-dim 1 `
-  --max-workers 1 `
+  --max-workers 2 `
   --rollout-days 7 `
   --batch-size 64 `
   --min-replay-before-train 64 `
@@ -56,7 +56,7 @@ python .\andruix_orchestrator_td3.py `
   --env ANDRUIX_START_MMDD=06/10 `
   --env ANDRUIX_END_MMDD=06/17 `
   --env ANDRUIX_POLICY_KIND=torch `
-  --tb-run-name denver_june10_smoke2 `
+  --tb-run-name denver_june10_smoke6 `
   --env ANDRUIX_REWARD_MODE=raw `
   --env ANDRUIX_REWARD_SCALE=3600000
 
@@ -64,8 +64,18 @@ python .\andruix_orchestrator_td3.py `
 
 ### Remove Item for old training
 '''
-Remove-Item -Recurse -Force .\shared\rollouts\inbox\* -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force .\shared\rollouts\done\*  -ErrorAction SilentlyContinue
-
+Remove-Item -Recurse -Force .\shared\rollouts\inbox\* -ErrorAction SilentlyContinue `
+Remove-Item -Recurse -Force .\shared\rollouts\done\*  -ErrorAction SilentlyContinue `
+Remove-Item -Recurse -Force .\shared\policy\latest\*  -ErrorAction SilentlyContinue `
+Remove-Item -Recurse -Force .\shared\logs\* -ErrorAction SilentlyContinue
 '''
 
+### Start Tensorboard
+'''
+tensorboard --logdir .\shared\tb --host 0.0.0.0 --port 6006
+
+Then Open
+
+http://localhost:6006
+
+'''
