@@ -114,26 +114,21 @@ class TorchPolicyModel:
 
     @torch.no_grad()
     def get_action(self, state_vec: np.ndarray) -> float:
-        """Return a zone setpoint (°C) given an observation vector."""
+        """Return a normalized action in [-1, 1] given an observation vector."""
         if self.actor is None:
-            return float(np.clip(self.default_sp, self.sp_min, self.sp_max))
+            return 0.0  # neutral action => mid setpoint
 
         s = np.asarray(state_vec, dtype=np.float32).reshape(1, -1)
         if self.obs_dim is not None and s.shape[1] != self.obs_dim:
             raise ValueError(f"state_vec dim mismatch: got {s.shape[1]} expected {self.obs_dim}")
 
         obs_t = torch.from_numpy(s).to(self.device)
-        act_t = self.actor(obs_t)
-        act = act_t.detach().cpu().numpy().reshape(-1)
-        a0 = float(act[0])  # this worker currently drives one setpoint actuator
+        act_t = self.actor(obs_t)  # should already be tanh-bounded if your Actor ends with tanh
+        a0 = float(act_t.detach().cpu().numpy().reshape(-1)[0])
 
-        if self.action_mode == "direct":
-            setpoint = a0
-        else:
-            denom = self.act_limit if abs(self.act_limit) > 1e-6 else 1.0
-            a_norm = float(np.clip(a0 / denom, -1.0, 1.0))
-            mid = 0.5 * (self.sp_min + self.sp_max)
-            half = 0.5 * (self.sp_max - self.sp_min)
-            setpoint = mid + a_norm * half
+        # If your actor is scaled by act_limit in the learner, normalize here.
+        denom = self.act_limit if abs(self.act_limit) > 1e-6 else 1.0
+        a_norm = float(np.clip(a0 / denom, -1.0, 1.0))
 
-        return float(np.clip(setpoint, self.sp_min, self.sp_max))
+        return a_norm
+

@@ -270,6 +270,12 @@ class TD3Learner:
 
             self.q_opt.zero_grad(set_to_none=True)
             q_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                list(self.q1.parameters()) + list(self.q2.parameters()),
+                max_norm=1.0
+            )
+
             self.q_opt.step()
 
             actor_loss = torch.tensor(0.0, device=self.device)
@@ -279,6 +285,7 @@ class TD3Learner:
                 actor_loss = -self.q1(obs, self.actor(obs)).mean()
                 self.actor_opt.zero_grad(set_to_none=True)
                 actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
                 self.actor_opt.step()
 
                 # polyak averaging
@@ -368,11 +375,13 @@ def docker_run_worker(spec: WorkerSpec) -> str:
         "--rollout-id", spec.rollout_id,
         "--rollout-dir", f"/shared/rollouts/inbox/{spec.rollout_id}",
         "--outdir", f"/shared/results/{spec.rollout_id}",
-        "--start-date", spec.extra_env["ANDRUIX_START_MMDD"],
-        "--end-date", spec.extra_env["ANDRUIX_END_MMDD"],
+        "--start-date", spec.extra_env["EPLUS_START_MMDD"],
+        "--end-date", spec.extra_env["EPLUS_END_MMDD"],
         "--policy-kind", spec.extra_env.get("ANDRUIX_POLICY_KIND", "torch"),
         "--reward-mode", spec.extra_env.get("ANDRUIX_REWARD_MODE", "raw"),
         "--reward-scale", spec.extra_env.get("ANDRUIX_REWARD_SCALE", "3600000"),
+        "--comfort-weight", "1.0",
+        "--slew-weight", "0.01",
     ]
 
 
@@ -805,7 +814,7 @@ def parse_args() -> argparse.Namespace:
     # TD3 knobs (starter defaults)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
-    p.add_argument("--policy-noise", type=float, default=0.2)
+    p.add_argument("--policy-noise", type=float, default=0.1)
     p.add_argument("--noise-clip", type=float, default=0.5)
     p.add_argument("--policy-delay", type=int, default=2)
     p.add_argument("--actor-lr", type=float, default=1e-3)

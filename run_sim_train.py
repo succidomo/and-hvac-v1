@@ -155,8 +155,10 @@ class RLController:
 
         # Worker-side policy (loads once at init, no per-timestep RPC)
         if self._is_torch_policy:
+            print("TorchPolicyModel..... loaded")
             self.rl_model = TorchPolicyModel(policy_path)
         else:
+            print("SimpleRLModel..... loaded")
             self.rl_model = SimpleRLModel()
 
         # TD3-style replay writer
@@ -173,6 +175,7 @@ class RLController:
 
         self.last_meter_val = None
         self.step_count = 0
+        self.dbg_count = 0
         self.init_attempts = 0
 
         self._prev_obs = None
@@ -362,7 +365,6 @@ class RLController:
             a = 0.0
         if not np.isfinite(a):
             a = 0.0
-        a = np.tanh(a)
         return float(np.clip(a, -1.0, 1.0))
 
     def _map_action_to_setpoints(self, a: float, occupied: bool) -> tuple[float, float, float]:
@@ -435,37 +437,24 @@ class RLController:
         # Policy action (normalized)
         obs_for_policy = obs if self._is_torch_policy else np.asarray([room_temp, outside_temp], dtype=np.float32)
         
-        
-        fixed = os.environ.get("ANDRUIX_FIXED_SP_C")
-        if fixed is not None:
-            center_sp = float(fixed)  # DEGREES C
+        a_norm_raw = self.rl_model.get_action(obs)
 
-            # choose deadband based on occupancy
-            deadband = self.deadband_occ if occupied else self.deadband_unocc
-            heat_sp = center_sp - deadband / 2
-            cool_sp = center_sp + deadband / 2
+        explore_noise = 0.1  # Or make configurable via env var/self.cfg
+        noise = np.random.normal(0, explore_noise)
+        a_norm_noisy = a_norm_raw + noise
 
-            # (optional) clamp heat/cool to safety limits you already have
-            heat_sp = max(heat_sp, self.min_heat_sp)
-            cool_sp = min(cool_sp, self.max_cool_sp)
+        a_norm = self._coerce_action(a_norm_noisy)
 
-            # store a *normalized* act for training/log consistency
-            if occupied:
-                cmin, cmax = self.sp_center_min_occ, self.sp_center_max_occ
-            else:
-                cmin, cmax = self.sp_center_min_unocc, self.sp_center_max_unocc
-            act = float(np.clip(2.0 * (center_sp - cmin) / (cmax - cmin) - 1.0, -1.0, 1.0))
-
-        else:
-            act_raw = self.rl_model.get_action(obs)
-
-            act = self._coerce_action(act_raw)
-
-            heat_sp, cool_sp, center_sp = self._map_action_to_setpoints(act, occupied)
+        heat_sp, cool_sp, center_sp = self._map_action_to_setpoints(a_norm, occupied)
 
         if self.step_count % 50 == 0:
             fixed = os.environ.get("ANDRUIX_FIXED_SP_C")
-            print(f"[dbg] fixed={fixed} act_raw={act_raw} act={act} obs0={obs[0]:.2f} obs1={obs[1]:.2f}")
+            print(f"[dbg] fixed={fixed} a_norm_raw={a_norm_raw} act={a_norm} obs0={obs[0]:.2f} obs1={obs[1]:.2f}")
+
+        if self.dbg_count < 10:
+            print(f"[dbg] a_norm_raw={a_norm_raw:.4f} a_norm={a_norm:.4f} center_sp={center_sp:.2f} heat={heat_sp:.2f} cool={cool_sp:.2f}")
+            self.dbg_count += 1
+
 
 
         self.api.exchange.set_actuator_value(state, self.heat_sp_handle, heat_sp)
@@ -476,7 +465,7 @@ class RLController:
         self._last_center_sp = center_sp
 
         self._prev_obs = obs
-        self._prev_act = act
+        self._prev_act = a_norm
         self._prev_day_of_year = doy
         self._prev_minute_of_day = mod
 
@@ -638,7 +627,7 @@ def main():
         policy_path=args.policy_path,
         policy_kind=args.policy_kind,
         dump_api_available_csv=args.dump_api_csv,
-        debug_meter_every_n_steps=20,
+        debug_meter_every_n_steps=1,
         reward_mode=args.reward_mode,
         reward_scale=args.reward_scale,
 
