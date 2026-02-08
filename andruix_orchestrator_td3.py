@@ -392,21 +392,13 @@ def docker_run_worker(spec: WorkerSpec) -> str:
         raise RuntimeError(f"docker run failed:\n{e.output}") from e
 
 
-def docker_ps(container_id: str) -> bool:
-    """Return True if container is still running."""
+def docker_inspect_status(cid: str) -> str:
     try:
-        out = subprocess.check_output(["docker", "ps", "-q", "--no-trunc"], stderr=subprocess.STDOUT, text=True)
-        # NOTE: Some environments alias 'docker' weirdly; leaving as "docker" below.
-    except Exception:
-        pass
-
-    try:
-        out = subprocess.check_output(["docker", "ps", "-q", "--no-trunc"], stderr=subprocess.STDOUT, text=True)
-        running = set([x.strip() for x in out.splitlines() if x.strip()])
-        return container_id in running
-    except subprocess.CalledProcessError:
-        return False
-
+        out = subprocess.check_output(["docker", "inspect", "--format={{.State.Status}}", cid], text=True).strip()
+        return out
+    except Exception as e:
+        print(f"[docker_inspect_status] cid={cid[:12]} error: {e}")
+        return "unknown"
 
 def docker_stop(container_id: str, timeout_s: int = 10) -> None:
     try:
@@ -414,7 +406,6 @@ def docker_stop(container_id: str, timeout_s: int = 10) -> None:
     except subprocess.CalledProcessError:
         # might already be stopped
         pass
-
 
 def docker_get_logs(container_id: str) -> str:
     """Return docker logs for a container (stdout+stderr). Container must still exist."""
@@ -616,19 +607,30 @@ class Orchestrator:
             print(f"[orchestrator] launched rollout {rollout_id} -> container {cid}")
 
     
-    def reap_finished_containers(self) -> None:
-        """Capture logs for finished containers and remove them."""
-        dead = []
-        for rid, cid in self.active.items():
-            if not docker_ps(cid):
-                dead.append(rid)
+    def reap_finished_containers(self) -> int:
+        to_reap = []
+        for rid, cid in list(self.active.items()):
+            status = docker_inspect_status(cid)
+            if status in ["exited", "dead"]:
+                to_reap.append((rid, cid))
 
-        for rid in dead:
+        n_reaped = len(to_reap)
+        if n_reaped == 0:
+            return 0
+
+        print(f"[orchestrator] reaping {n_reaped} finished containers")
+
+        for rid, cid in to_reap:
+            try:
+                docker_stop(cid)
+            except Exception as e:
+                print(f"[orchestrator] WARNING: docker_stop failed rid={rid} cid={cid[:12]}: {e}")
+
             if self.capture_logs:
                 try:
                     logs_text = docker_get_logs(cid)
                     header = (
-                        f"===== Andruix worker logs (reaped) =====\n"
+                        "===== Andruix worker logs (reaped) =====\n"
                         f"rollout_id: {rid}\n"
                         f"container_id: {cid}\n"
                         f"captured_at_unix: {time.time()}\n"
@@ -642,7 +644,7 @@ class Orchestrator:
 
                     # Try Azure upload first if configured
                     uploaded = False
-                    if self.container_client:  # ← changed from self.blob_client
+                    if self.container_client:
                         try:
                             # Blob path: <tb_run_name>/worker_<rollout_id>.log
                             blob_name = f"{log_folder}/worker_{rid}.log"
@@ -650,14 +652,15 @@ class Orchestrator:
                             blob_client = self.container_client.get_blob_client(blob_name)
                             blob_client.upload_blob(full_logs.encode('utf-8'), overwrite=True)
 
-                            # Optional: Set to Cool tier after upload (if you want logs in Cool)
-                            # blob_client.set_standard_blob_tier("Cool")
+                            # Optional: Set to Cool tier after upload
+                            blob_client.set_standard_blob_tier("Cool")
 
                             print(f"[orchestrator] Uploaded logs to Azure: "
-                                f"{self.azure_storage_account}/{self.azure_storage_container}/{blob_name}")
+                                  f"{self.azure_storage_account}/{self.azure_storage_container}/{blob_name}")
                             uploaded = True
                         except Exception as e:
                             print(f"[orchestrator] WARNING: Azure upload failed for {rid}: {e}. Falling back to local.")
+
                     # Local fallback (or only path if no Azure)
                     if not uploaded:
                         # Create subfolder under logs_dir
@@ -669,9 +672,17 @@ class Orchestrator:
                         print(f"[orchestrator] Wrote local logs -> {log_path}")
 
                 except Exception as e:
-                    print(f"[orchestrator] WARNING: failed to capture/save logs rid={rid} cid={cid}: {e}")
-            else:
-                print(f"[orchestrator] Log capture disabled; skipping for rid={rid}")
+                    print(f"[orchestrator] WARNING: failed to capture/save logs rid={rid} cid={cid[:12]}: {e}")
+
+            try:
+                docker_rm(cid)
+            except Exception as e:
+                print(f"[orchestrator] WARNING: docker_rm failed rid={rid} cid={cid[:12]}: {e}")
+
+            # Remove from active (key fix to avoid re-reaping)
+            del self.active[rid]
+
+        return n_reaped
 
     def ingest_completed_rollouts(self) -> int:
         inbox_dir = self.paths["inbox_dir"]
