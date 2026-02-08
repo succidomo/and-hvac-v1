@@ -880,14 +880,13 @@ def main() -> int:
     shared_root = Path(args.shared_root).resolve()
 
     # Determine Azure connection string: CLI arg takes precedence over env var
-    azure_conn_str = args.azure_connection_string
-    if azure_conn_str is None:
-        azure_conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-        if azure_conn_str:
-            print("[orchestrator] Using Azure connection string from environment variable AZURE_STORAGE_CONNECTION_STRING")
-        else:
-            print("[orchestrator] No Azure connection string provided (neither CLI nor AZURE_STORAGE_CONNECTION_STRING env var). "
-                  "Logs will be saved locally only.")
+
+    azure_conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    if azure_conn_str:
+        print("[orchestrator] Using Azure connection string from environment variable AZURE_STORAGE_CONNECTION_STRING")
+    else:
+        print("[orchestrator] No Azure connection string provided (neither CLI nor AZURE_STORAGE_CONNECTION_STRING env var). "
+                "Logs will be saved locally only.")
 
     extra_env: Dict[str, str] = {}
     for item in args.env:
