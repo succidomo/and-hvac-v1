@@ -273,7 +273,7 @@ class TD3Learner:
 
             torch.nn.utils.clip_grad_norm_(
                 list(self.q1.parameters()) + list(self.q2.parameters()),
-                max_norm=1.0
+                max_norm=0.5
             )
 
             self.q_opt.step()
@@ -285,7 +285,7 @@ class TD3Learner:
                 actor_loss = -self.q1(obs, self.actor(obs)).mean()
                 self.actor_opt.zero_grad(set_to_none=True)
                 actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
                 self.actor_opt.step()
 
                 # polyak averaging
