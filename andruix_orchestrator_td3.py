@@ -485,7 +485,11 @@ class Orchestrator:
         extra_env: Optional[Dict[str, str]] = None,
         tb_logdir: Optional[Path] = None,
         tb_run_name: Optional[str] = None,
-        tb_flush_secs: int = 10
+        tb_flush_secs: int = 10,
+        capture_logs: bool = True,
+        azure_storage_account: Optional[str] = None,
+        azure_storage_container: str = "worker-logs",
+        azure_connection_string: Optional[str] = None
     ):
         self.shared_root = shared_root
         self.paths = ensure_dirs(shared_root)
@@ -498,6 +502,16 @@ class Orchestrator:
         self.worker_cpus = worker_cpus
         self.worker_mem = worker_mem
         self.extra_env = extra_env or {}
+        self.capture_logs = capture_logs
+        self.azure_storage_account = azure_storage_account
+        self.azure_storage_container = azure_storage_container
+        self.azure_connection_string = azure_connection_string
+        self.tb_run_name = tb_run_name or f"run-{int(time.time())}"
+
+        self.blob_client = None
+        if self.azure_storage_account:
+            from azure.storage.blob import BlobServiceClient
+            self.blob_client = BlobServiceClient.from_connection_string(self.azure_connection_string)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.learner = TD3Learner(obs_dim, act_dim, cfg, self.device)
@@ -591,26 +605,57 @@ class Orchestrator:
                 dead.append(rid)
 
         for rid in dead:
-            cid = self.active.pop(rid, "")
-            # Capture docker logs BEFORE removing container
-            try:
-                logs_text = docker_get_logs(cid)
-                log_path = self.paths["logs_dir"] / f"worker_{rid}.log"
-                header = (
-                    f"===== Andruix worker logs ====="
-                    f"rollout_id: {rid}"
-                    f"container_id: {cid}"
-                    f"captured_at_unix: {time.time()}"
-                    f"==============================="
-                )
-                log_path.write_text(header + logs_text, encoding="utf-8")
-                print(f"[orchestrator] wrote worker logs -> {log_path}")
-            except Exception as e:
-                print(f"[orchestrator] WARNING: failed to capture logs for rollout {rid} cid={cid}: {e}")
+            if self.capture_logs:
+                try:
+                    logs_text = docker_get_logs(cid)
+                    header = (
+                        f"===== Andruix worker logs (reaped) =====\n"
+                        f"rollout_id: {rid}\n"
+                        f"container_id: {cid}\n"
+                        f"captured_at_unix: {time.time()}\n"
+                        f"tb_run_name: {self.tb_run_name}\n"
+                        "========================================\n"
+                    )
+                    full_logs = header + logs_text
 
-            # Remove container (we intentionally do NOT use --rm so we can capture logs)
-            docker_rm(cid)
-            print(f"[orchestrator] container ended for rollout {rid} (cid={cid})")
+                    # Determine the "folder" name (virtual for Azure, real for local)
+                    log_folder = self.tb_run_name
+
+                    # Try Azure upload first if configured
+                    uploaded = False
+                    if self.blob_client:
+                        try:
+                            container_client = self.blob_client.get_container_client(self.azure_storage_container)
+
+                            # Blob path: <tb_run_name>/worker_<rollout_id>.log
+                            blob_name = f"{log_folder}/worker_{rid}.log"
+
+                            blob_client = container_client.get_blob_client(blob_name)
+                            blob_client.upload_blob(full_logs.encode('utf-8'), overwrite=True)
+
+                            # Optional: set to Cool tier
+                            blob_client.set_standard_blob_tier("Cool")
+
+                            print(f"[orchestrator] Uploaded logs to Azure: "
+                                f"{self.azure_storage_account}/{self.azure_storage_container}/{blob_name}")
+                            uploaded = True
+                        except Exception as e:
+                            print(f"[orchestrator] WARNING: Azure upload failed for {rid}: {e}. Falling back to local.")
+
+                    # Local fallback (or only path if no Azure)
+                    if not uploaded:
+                        # Create subfolder under logs_dir
+                        run_log_dir = self.paths["logs_dir"] / log_folder
+                        run_log_dir.mkdir(parents=True, exist_ok=True)
+
+                        log_path = run_log_dir / f"worker_{rid}.log"
+                        log_path.write_text(full_logs, encoding="utf-8")
+                        print(f"[orchestrator] Wrote local logs -> {log_path}")
+
+                except Exception as e:
+                    print(f"[orchestrator] WARNING: failed to capture/save logs rid={rid} cid={cid}: {e}")
+            else:
+                print(f"[orchestrator] Log capture disabled; skipping for rid={rid}")
 
     def ingest_completed_rollouts(self) -> int:
         inbox_dir = self.paths["inbox_dir"]
@@ -820,6 +865,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--actor-lr", type=float, default=1e-3)
     p.add_argument("--critic-lr", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--capture-logs", action="store_true", default=True, help="Capture and save Docker container logs (default: True). Disable for performance.")
+    p.add_argument("--azure-storage-account", type=str, default="arduixpoca", help="Azure Storage Account name for uploading logs (optional; falls back to local disk).")
+    p.add_argument("--azure-storage-container", type=str, default="worker-logs", help="Azure Blob container for logs (default: worker-logs).")
 
     # Pass-through env to containers (repeatable key=value)
     p.add_argument("--env", action="append", default=[], help="Extra env var for workers, format KEY=VALUE (repeatable)")
@@ -830,6 +878,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     shared_root = Path(args.shared_root).resolve()
+
+    # Determine Azure connection string: CLI arg takes precedence over env var
+    azure_conn_str = args.azure_connection_string
+    if azure_conn_str is None:
+        azure_conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        if azure_conn_str:
+            print("[orchestrator] Using Azure connection string from environment variable AZURE_STORAGE_CONNECTION_STRING")
+        else:
+            print("[orchestrator] No Azure connection string provided (neither CLI nor AZURE_STORAGE_CONNECTION_STRING env var). "
+                  "Logs will be saved locally only.")
 
     extra_env: Dict[str, str] = {}
     for item in args.env:
@@ -866,7 +924,11 @@ def main() -> int:
         extra_env=extra_env,
         tb_logdir=(Path(args.tb_logdir).resolve() if args.tb_logdir else None),
         tb_run_name=args.tb_run_name,
-        tb_flush_secs=args.tb_flush_secs
+        tb_flush_secs=args.tb_flush_secs,
+        capture_logs=args.capture_logs,
+        azure_storage_account=args.azure_storage_account,
+        azure_storage_container=args.azure_storage_container,
+        azure_connection_string=azure_conn_str
     )
     orch.run_forever(poll_s=2.0)
     return 0

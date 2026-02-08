@@ -47,6 +47,12 @@ mkdir shared\logs -ErrorAction SilentlyContinue | Out-Null
 '''
 docker build -t andruix/eplus:latest -f Dockerfile .
 
+# Add to your shell profile (so it's set every login)
+echo 'export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=youraccount;AccountKey=yourkey;EndpointSuffix=core.windows.net"' >> ~/.bashrc
+
+# Or for current session only
+export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=youraccount;AccountKey=yourkey;EndpointSuffix=core.windows.net"
+
 python .\andruix_orchestrator_td3.py `
   --shared-root .\shared `
   --image andruix/eplus:latest `
@@ -120,4 +126,43 @@ sudo usermod -aG docker $USER
 
 # Log out and log back in (or run `newgrp docker`) for the group change to take effect
 exit  # Then SSH back in
+'''
+
+### Install azure cli linux
+'''
+# Install Azure CLI (official Microsoft way)
+curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+# Log in to Azure (browser will open or you get a code to enter)
+az login
+
+# Log in to your specific ACR (this injects a fresh token into Docker)
+az acr login --name arduixcr01
+
+# Now try pull (no sudo needed)
+docker pull arduixcr01.azurecr.io/arduix/eplus:latest
+'''
+
+### Setup  python env 
+'''
+# Create and activate virtual env
+mkdir -p ~/arduix_env
+python3 -m venv ~/arduix_env
+source ~/arduix_env/bin/activate
+
+# Upgrade pip and install packages
+pip install --upgrade pip
+pip install numpy torch tensorboard tensorboardX  # tensorboardX if needed for older compat
+pip install torch torchvision torchaudio  # For full Torch support
+
+# If you have a GPU and want CUDA (check with `nvidia-smi` if drivers are installed)
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118  # Adjust CUDA version as needed
+
+# Deactivate when done (but reactivate before running the script)
+deactivate
+
+# Verify
+source ~/andruix_env/bin/activate
+python -c "import torch; print(torch.__version__); print('CUDA available:', torch.cuda.is_available())"
+deactivate
 '''
