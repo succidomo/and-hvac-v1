@@ -509,9 +509,28 @@ class Orchestrator:
         self.tb_run_name = tb_run_name or f"run-{int(time.time())}"
 
         self.blob_client = None
-        if self.azure_storage_account:
-            from azure.storage.blob import BlobServiceClient
-            self.blob_client = BlobServiceClient.from_connection_string(self.azure_connection_string)
+        if azure_storage_account and azure_connection_string:
+            try:
+                from azure.storage.blob import BlobServiceClient
+                self.blob_client = BlobServiceClient.from_connection_string(azure_connection_string)
+                print(f"[orchestrator] Azure Blob client initialized for account: {azure_storage_account}")
+
+                # Get container client
+                self.container_client = self.blob_client.get_container_client(azure_storage_container)
+
+                # Create container if it doesn't exist
+                if not self.container_client.exists():
+                    print(f"[orchestrator] Container '{azure_storage_container}' does not exist. Creating it...")
+                    self.container_client.create_container()
+                    print(f"[orchestrator] Container '{azure_storage_container}' created successfully.")
+                else:
+                    print(f"[orchestrator] Container '{azure_storage_container}' already exists.")
+
+            except Exception as e:
+                print(f"[orchestrator] WARNING: Failed to initialize or create Azure container: {e}. "
+                    "Logs will fall back to local disk.")
+                self.blob_client = None
+                self.container_client = None
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.learner = TD3Learner(obs_dim, act_dim, cfg, self.device)
@@ -623,25 +642,22 @@ class Orchestrator:
 
                     # Try Azure upload first if configured
                     uploaded = False
-                    if self.blob_client:
+                    if self.container_client:  # ← changed from self.blob_client
                         try:
-                            container_client = self.blob_client.get_container_client(self.azure_storage_container)
-
                             # Blob path: <tb_run_name>/worker_<rollout_id>.log
                             blob_name = f"{log_folder}/worker_{rid}.log"
 
-                            blob_client = container_client.get_blob_client(blob_name)
+                            blob_client = self.container_client.get_blob_client(blob_name)
                             blob_client.upload_blob(full_logs.encode('utf-8'), overwrite=True)
 
-                            # Optional: set to Cool tier
-                            blob_client.set_standard_blob_tier("Cool")
+                            # Optional: Set to Cool tier after upload (if you want logs in Cool)
+                            # blob_client.set_standard_blob_tier("Cool")
 
                             print(f"[orchestrator] Uploaded logs to Azure: "
                                 f"{self.azure_storage_account}/{self.azure_storage_container}/{blob_name}")
                             uploaded = True
                         except Exception as e:
                             print(f"[orchestrator] WARNING: Azure upload failed for {rid}: {e}. Falling back to local.")
-
                     # Local fallback (or only path if no Azure)
                     if not uploaded:
                         # Create subfolder under logs_dir
