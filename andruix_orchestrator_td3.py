@@ -382,6 +382,7 @@ def docker_run_worker(spec: WorkerSpec) -> str:
         "--reward-scale", spec.extra_env.get("ANDRUIX_REWARD_SCALE", "3600000"),
         "--comfort-weight", "1.0",
         "--slew-weight", "0.01",
+        "--energy-meter", "Electricity:HVAC"
     ]
 
 

@@ -153,6 +153,8 @@ class RLController:
         self.policy_kind = (policy_kind or "simple").lower()
         self._is_torch_policy = self.policy_kind == "torch"
 
+        print(f"Energy Meter used for reward fuction: {self.energy_meter_name}")
+
         # Worker-side policy (loads once at init, no per-timestep RPC)
         if self._is_torch_policy:
             print("TorchPolicyModel..... loaded")
@@ -448,14 +450,7 @@ class RLController:
         heat_sp, cool_sp, center_sp = self._map_action_to_setpoints(a_norm, occupied)
 
         if self.step_count % 50 == 0:
-            fixed = os.environ.get("ANDRUIX_FIXED_SP_C")
-            print(f"[dbg] fixed={fixed} a_norm_raw={a_norm_raw} act={a_norm} obs0={obs[0]:.2f} obs1={obs[1]:.2f}")
-
-        if self.dbg_count < 10:
-            print(f"[dbg] a_norm_raw={a_norm_raw:.4f} a_norm={a_norm:.4f} center_sp={center_sp:.2f} heat={heat_sp:.2f} cool={cool_sp:.2f}")
-            self.dbg_count += 1
-
-
+            print(f"[dbg begin timestep] a_norm_raw={a_norm_raw} act={a_norm} obs0={obs[0]:.2f} obs1={obs[1]:.2f}  center_sp={center_sp:.2f} heat={heat_sp:.2f} cool={cool_sp:.2f}")
 
         self.api.exchange.set_actuator_value(state, self.heat_sp_handle, heat_sp)
         self.api.exchange.set_actuator_value(state, self.cool_sp_handle, cool_sp)
@@ -473,10 +468,16 @@ class RLController:
         if not self._ensure_ready(state):
             return
 
+        confirmed_heat = self.api.exchange.get_actuator_value(state, self.heat_sp_handle)
+        confirmed_cool = self.api.exchange.get_actuator_value(state, self.cool_sp_handle)
         raw_val = self.api.exchange.get_meter_value(state, self.facility_elec_meter_handle)
+
         if raw_val == 0.0 and self.api.exchange.api_error_flag(state):
             print("[meter] api_error_flag=True reading meter; handle likely invalid")
             return
+        
+        if self.step_count % 10 == 0:  # Your suggested frequency
+            print(f"[verify_end_timestep] Set heat_end_confirmed={confirmed_heat:.2f}; cool_end_confirmed={confirmed_cool:.2f}")
 
         delta = 0.0
         if self.last_meter_val is not None:
@@ -545,7 +546,7 @@ class RLController:
 
 def parse_args():
     p = argparse.ArgumentParser(description="EnergyPlus + PyEnergyPlus callback runner (Step 1.2: time + trend features)")
-    p.add_argument("--idf", default=os.environ.get("EPLUS_IDF", "/home/guser/models/IECC_OfficeMedium_STD2021_Denver_RL_BASELINE_1_0.idf"))
+    p.add_argument("--idf", default=os.environ.get("EPLUS_IDF", "/home/guser/models/IECC_OfficeMedium_STD2021_Denver_RL_HIGH_ENERGY.idf"))
     p.add_argument("--epw", default=os.environ.get("EPLUS_EPW", "/home/guser/weather/5B_USA_CO_BOULDER.epw"))
     p.add_argument("--outdir", default=os.environ.get("EPLUS_OUTDIR", "/home/guser/results/"))
     p.add_argument("--zone", default=os.environ.get("EPLUS_ZONE", "PERIMETER_BOT_ZN_3"))
