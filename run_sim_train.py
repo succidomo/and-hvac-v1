@@ -50,7 +50,7 @@ class RLController:
         dump_api_available_csv: bool = True,
         debug_meter_every_n_steps: int = 20,
         reward_mode: str = "delta",
-        reward_scale: float = 1e6,
+        reward_scale: float = 3.6e6,
 
         # --- Observation features ---
         include_occ_flag: bool = True,
@@ -505,8 +505,13 @@ class RLController:
         self._prev_minute_of_day = None
 
         # Policy action (normalized) - now a vector [num_zones] if multi-zone
-        obs_for_policy = obs if self._is_torch_policy else np.asarray([room_temp, outside_temp], dtype=np.float32)  # Update for multi-zone if needed
-        
+        if self._is_torch_policy:
+            obs_for_policy = obs  # Full concatenated obs for Torch (already multi-zone ready)
+        else:
+            # For simple policy: Average zone temps as fallback (placeholder)
+            avg_room_temp = np.nanmean(list(zone_temps.values())) if zone_temps else np.nan
+            obs_for_policy = np.asarray([avg_room_temp, outside_temp], dtype=np.float32)
+
         a_norm_raw = self.rl_model.get_action(obs_for_policy)  # Outputs vector [num_zones] - see notes below
 
         explore_noise = 0.1  # Or make configurable via env var/self.cfg
