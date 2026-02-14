@@ -190,7 +190,8 @@ class RLController:
         # Last applied setpoints (for comfort + slew penalty)
         self._last_heat_sp = {zone: None for zone in self.ZONES}
         self._last_cool_sp = {zone: None for zone in self.ZONES}
-        self._last_center_sp = None
+        self._prev_center_sp = {zone: None for zone in self.ZONES}
+        self._last_center_sp = {zone: None for zone in self.ZONES}
 
         # List of (variable_name, key) pairs we want
         variables_to_request = [
@@ -246,7 +247,7 @@ class RLController:
                 print(f"[WARN] Invalid handle for zone {zone} - check zone name/spelling in IDF")
         
         missing = [name for name, h in {
-            "room_temp_handle": self.room_temp_handle,
+            "room_temp_handle": self.room_temp_handles,
             "outside_temp_handle": self.outside_temp_handle,
             f"meter({self.energy_meter_name})": self.facility_elec_meter_handle,
             "heat_sp_handle": self.heat_sp_handle,
@@ -535,6 +536,8 @@ class RLController:
             # Store last values per zone (adapt your _last_* to dicts if needed)
             self._last_heat_sp[zone] = heat_sp
             self._last_cool_sp[zone] = cool_sp
+            if self._last_center_sp[zone] is not None:
+                self._prev_center_sp[zone] = self._last_center_sp[zone]
             self._last_center_sp[zone] = center_sp
 
         self._prev_obs = obs
@@ -546,18 +549,40 @@ class RLController:
         if not self._ensure_ready(state):
             return
 
-        confirmed_heat = self.api.exchange.get_actuator_value(state, self.heat_sp_handle)
-        confirmed_cool = self.api.exchange.get_actuator_value(state, self.cool_sp_handle)
-        outside_temp = self.api.exchange.get_variable_value(state, self.outside_temp_handle)
-        raw_val = self.api.exchange.get_meter_value(state, self.facility_elec_meter_handle)
+        # 1. Get current zone temperatures (dict: zone → temp)
+        zone_temps = {}
+        for zone in self.ZONES:
+            handle = self.room_temp_handles.get(zone, -1)
+            if handle == -1:
+                continue
+            temp = self.api.exchange.get_variable_value(state, handle)
+            zone_temps[zone] = temp if temp is not None else np.nan
 
+        # 2. Confirm setpoints per zone (for debug)
+        confirmed_setpoints = {}
+        for zone in self.ZONES:
+            h_handle = self.heat_sp_handles.get(zone, -1)
+            c_handle = self.cool_sp_handles.get(zone, -1)
+            if h_handle != -1 and c_handle != -1:
+                confirmed_heat = self.api.exchange.get_actuator_value(state, h_handle)
+                confirmed_cool = self.api.exchange.get_actuator_value(state, c_handle)
+                confirmed_setpoints[zone] = (confirmed_heat, confirmed_cool)
+
+        # Optional: log confirmed setpoints (every 10 steps)
+        if self.step_count % 10 == 0:
+            for zone, (h, c) in confirmed_setpoints.items():
+                print(f"[verify_end] Zone {zone}: heat_confirmed={h:.2f}, cool_confirmed={c:.2f}")
+
+        # 3. Outside temp (shared)
+        outside_temp = self.api.exchange.get_variable_value(state, self.outside_temp_handle)
+
+        # 4. Meter reading (shared — facility or HVAC)
+        raw_val = self.api.exchange.get_meter_value(state, self.facility_elec_meter_handle)
         if raw_val == 0.0 and self.api.exchange.api_error_flag(state):
             print("[meter] api_error_flag=True reading meter; handle likely invalid")
             return
-        
-        if self.step_count % 10 == 0:  # Your suggested frequency
-            print(f"[verify_end_timestep] Set heat_end_confirmed={confirmed_heat:.2f}; cool_end_confirmed={confirmed_cool:.2f}, outside_temp={outside_temp:.2f}")
 
+        # Delta calculation (same as before)
         delta = 0.0
         if self.last_meter_val is not None:
             delta = float(raw_val) - float(self.last_meter_val)
@@ -569,38 +594,62 @@ class RLController:
         scale = self.reward_scale if self.reward_scale != 0.0 else 1.0
         energy_kwh = use_val / scale
 
-        temp_now = self.api.exchange.get_variable_value(state, self.room_temp_handle)
-        occupied = self._is_occupied(self._prev_minute_of_day)
-
+        # 5. Comfort & hard penalties — per-zone, then average
         comfort_pen = 0.0
-        if occupied and self.comfort_weight > 0.0:
-            v = self._temp_violation(temp_now, self.comfort_low, self.comfort_high)
-            comfort_pen = self.comfort_weight * (v * v)
-
         hard_pen = 0.0
-        if self.hard_weight > 0.0:
-            v = self._temp_violation(temp_now, self.hard_low, self.hard_high)
-            hard_pen = self.hard_weight * (v * v)
+        num_valid_zones = 0
 
+        occupied = self._is_occupied(self._prev_minute_of_day)  # assuming shared occupancy
+
+        if occupied and (self.comfort_weight > 0.0 or self.hard_weight > 0.0):
+            for zone, temp_now in zone_temps.items():
+                if np.isnan(temp_now):
+                    continue
+                num_valid_zones += 1
+
+                # Comfort penalty (squared violation)
+                if self.comfort_weight > 0.0:
+                    v = self._temp_violation(temp_now, self.comfort_low, self.comfort_high)
+                    comfort_pen += self.comfort_weight * (v * v)
+
+                # Hard penalty
+                if self.hard_weight > 0.0:
+                    v = self._temp_violation(temp_now, self.hard_low, self.hard_high)
+                    hard_pen += self.hard_weight * (v * v)
+
+            # Average (normalize by num zones to keep scale consistent)
+            if num_valid_zones > 0:
+                comfort_pen /= num_valid_zones
+                hard_pen /= num_valid_zones
+
+        # 6. Slew penalty — per-zone, then average
         slew_pen = 0.0
-        if self.slew_weight > 0.0 and self._last_center_sp is not None:
-            if getattr(self, "_prev_center_sp", None) is not None:
-                d = float(self._last_center_sp) - float(self._prev_center_sp)
-                slew_pen = self.slew_weight * (d * d)
-            self._prev_center_sp = float(self._last_center_sp)
+        if self.slew_weight > 0.0:
+            slew_sum = 0.0
+            for zone in self.ZONES:
+                prev = self._prev_center_sp.get(zone)
+                last = self._last_center_sp.get(zone)
+                if prev is not None and last is not None:
+                    d = float(last) - float(prev)
+                    slew_sum += self.slew_weight * (d * d)
+            # Average
+            slew_pen = slew_sum / max(1, len(self.ZONES))
 
+        # 7. Total reward
         rew = -energy_kwh - comfort_pen - hard_pen - slew_pen
 
+        # 8. Step count & debug print (updated for multi-zone summary)
         self.step_count += 1
         if self.debug_meter_every_n_steps and (self.step_count % self.debug_meter_every_n_steps == 0):
             meter_str = f"raw={raw_val:.2f}" if self.reward_mode == "raw" else f"delta={delta:.2f}"
+            avg_tz = np.nanmean(list(zone_temps.values())) if zone_temps else np.nan
             print(
                 f"[step {self.step_count}] {meter_str} kWh={energy_kwh:.4f} "
-                f"Tz={temp_now:.2f}C occ={occupied} "
-                f"Hsp={self._last_heat_sp:.1f} Csp={self._last_cool_sp:.1f} "
+                f"avg_Tz={avg_tz:.2f}C occ={occupied} "
                 f"pen(c={comfort_pen:.3f}, h={hard_pen:.3f}, s={slew_pen:.3f}) rew={rew:.4f}"
             )
 
+        # 9. Store for rollout
         self._pending_rew = rew
         self._pending_energy = energy_kwh
 
