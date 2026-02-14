@@ -10329,6 +10329,23 @@
 
   Output:Variable,PERIMETER_BOT_ZN_3,Zone Thermostat Cooling Setpoint Temperature,Timestep;
 
+  Output:Variable,CORE_BOTTOM,Zone Thermostat Heating Setpoint Temperature,Timestep;
+
+  Output:Variable,CORE_BOTTOM,Zone Thermostat Cooling Setpoint Temperature,Timestep;
+
+  Output:Variable,PERIMETER_BOT_ZN_1,Zone Thermostat Heating Setpoint Temperature,Timestep;
+
+  Output:Variable,PERIMETER_BOT_ZN_1,Zone Thermostat Cooling Setpoint Temperature,Timestep;
+
+  Output:Variable,PERIMETER_BOT_ZN_2,Zone Thermostat Heating Setpoint Temperature,Timestep;
+
+  Output:Variable,PERIMETER_BOT_ZN_2,Zone Thermostat Cooling Setpoint Temperature,Timestep;
+
+  Output:Variable,PERIMETER_BOT_ZN_4,Zone Thermostat Heating Setpoint Temperature,Timestep;
+
+  Output:Variable,PERIMETER_BOT_ZN_4,Zone Thermostat Cooling Setpoint Temperature,Timestep;
+
+
   Output:EnergyManagementSystem,
     Verbose,
     Verbose,

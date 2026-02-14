@@ -40,7 +40,7 @@ class RLController:
         self,
         api: EnergyPlusAPI,
         state,
-        zone_name: str,
+        zone_names: str,
         outdir: Path,
         rollout_dir: Path,
         rollout_id: str,
@@ -84,7 +84,7 @@ class RLController:
     ):
         self.api = api
         self.state = state
-        self.ZONE = zone_name
+        self.ZONES = zone_names.split(',')
         self.outdir = Path(outdir)
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.rollout_dir = Path(rollout_dir)
@@ -169,11 +169,11 @@ class RLController:
         # Handle readiness / sentinels
         self.handles_ready = False
         self.api_dumped = False
-        self.room_temp_handle = -1
-        self.outside_temp_handle = -1
         self.facility_elec_meter_handle = -1
         self.heat_sp_handle = -1
         self.cool_sp_handle = -1
+        self.room_temp_handles = {}          # zone_name → handle
+        self.outside_temp_handle = None      # shared
 
         self.last_meter_val = None
         self.step_count = 0
@@ -188,21 +188,31 @@ class RLController:
         self._prev_minute_of_day = None
 
         # Last applied setpoints (for comfort + slew penalty)
-        self._last_heat_sp = None
-        self._last_cool_sp = None
+        self._last_heat_sp = {zone: None for zone in self.ZONES}
+        self._last_cool_sp = {zone: None for zone in self.ZONES}
         self._last_center_sp = None
 
-        # Request variables you plan to read
-        for var, key in [
-            ("Zone Mean Air Temperature", self.ZONE),
+        # List of (variable_name, key) pairs we want
+        variables_to_request = [
             ("Site Outdoor Air Drybulb Temperature", "Environment"),
-        ]:
-            self.api.exchange.request_variable(state, var, key)
+        ]
+
+        # Add one entry per zone for zone mean air temperature
+        for zone_name in self.ZONES:
+            variables_to_request.append(("Zone Mean Air Temperature", zone_name))
+
+        # Now request them all
+        for var_name, key in variables_to_request:
+            self.api.exchange.request_variable(state, var_name, key)
 
         # Callbacks
         self.api.runtime.callback_after_new_environment_warmup_complete(state, self._try_init_handles)
         self.api.runtime.callback_begin_zone_timestep_before_init_heat_balance(state, self.begin_timestep_callback)
         self.api.runtime.callback_end_system_timestep_after_hvac_reporting(state, self.end_system_timestep_callback)
+
+        # History: now per zone + outside
+        self._zone_hist = {zone: deque(maxlen=self._max_trend_window) for zone in self.ZONES}
+        self._outside_hist = deque(maxlen=self._max_trend_window)
 
     # ---- init / readiness ----
     def _try_init_handles(self, state):
@@ -223,11 +233,13 @@ class RLController:
                 print(f"[init] WARNING: failed to write api_available.csv: {e}")
                 self.api_dumped = True
 
-        self.room_temp_handle = self.api.exchange.get_variable_handle(state, "Zone Mean Air Temperature", self.ZONE)
         self.outside_temp_handle = self.api.exchange.get_variable_handle(state, "Site Outdoor Air Drybulb Temperature", "Environment")
         self.facility_elec_meter_handle = self.api.exchange.get_meter_handle(state, self.energy_meter_name)
-        self.heat_sp_handle = self.api.exchange.get_actuator_handle(state, "Zone Temperature Control", "Heating Setpoint", self.ZONE)
-        self.cool_sp_handle = self.api.exchange.get_actuator_handle(state, "Zone Temperature Control", "Cooling Setpoint", self.ZONE)
+
+        for zone in self.zones:
+            self.heat_sp_handles[zone] = self.api.exchange.get_actuator_handle(state, "Zone Temperature Control", "Heating Setpoint", zone)
+            self.cool_sp_handles[zone] = self.api.exchange.get_actuator_handle(state, "Zone Temperature Control", "Cooling Setpoint", zone)
+            self.room_temp_handles[zone] = self.api.exchange.get_variable_handle(state, "Zone Mean Air Temperature", zone)
 
         missing = [name for name, h in {
             "room_temp_handle": self.room_temp_handle,
@@ -284,15 +296,11 @@ class RLController:
         return m >= start or m < end
 
     # ---- trend features ----
-    def _push_history(self, abs_minute: int | None, room_temp: float, outside_temp: float):
-        if abs_minute is None:
-            return
-        self._hist.append((int(abs_minute), float(room_temp), float(outside_temp)))
-        if self._max_trend_window <= 0:
-            return
-        cutoff = int(abs_minute) - int(self._max_trend_window) - 1
-        while self._hist and self._hist[0][0] < cutoff:
-            self._hist.popleft()
+    def _push_history(self, abs_minute, zone_temp=None, outside_temp=None, zone=None):
+        if zone is not None:  # Per-zone push
+            self._zone_hist[zone].append((abs_minute, zone_temp))
+        else:  # Outside push
+            self._outside_hist.append((abs_minute, outside_temp))
 
     def _lookup_at_or_before(self, target_abs_minute: int) -> tuple[float, float] | None:
         # Scan from newest backwards to find the closest value at or before target time.
@@ -333,31 +341,64 @@ class RLController:
 
         return feats
 
-    def _make_obs(self, room_temp: float, outside_temp: float, doy: int | None, mod: int | None, abs_minute: int | None) -> tuple[np.ndarray, bool]:
-        # time-of-day features
-        if mod is None:
-            mod = 0
-        ang_tod = 2.0 * np.pi * (float(mod) / 1440.0)
-        sin_tod = float(np.sin(ang_tod))
-        cos_tod = float(np.cos(ang_tod))
+    def _make_obs_multi_zone(self, zone_temps_dict, outside_temp, doy, mod, abs_minute):
+        obs_parts = []
 
-        feats: list[float] = [float(room_temp), float(outside_temp), sin_tod, cos_tod]
+        # Outside temperature
+        obs_parts.append(outside_temp)
 
+        # Shared: Toa + time features
         if self.include_doy_features:
-            if doy is None:
-                doy = 1
-            ang_doy = 2.0 * np.pi * ((float(doy) - 1.0) / 365.0)
-            feats += [float(np.sin(ang_doy)), float(np.cos(ang_doy))]
+            tod = mod / 1440.0  # Normalize minute_of_day to [0,1] — adjust if needed
+            sin_tod = np.sin(2 * np.pi * tod)
+            cos_tod = np.cos(2 * np.pi * tod)
+            sin_doy = np.sin(2 * np.pi * (doy / 365.0))
+            cos_doy = np.cos(2 * np.pi * (doy / 365.0))
+            obs_parts.extend([outside_temp, sin_tod, cos_tod, sin_doy, cos_doy])
+        else:
+            obs_parts.append(outside_temp)
 
-        occupied = self._is_occupied(mod)
+        # Optional shared occ_flag
         if self.include_occ_flag:
-            feats.append(1.0 if occupied else 0.0)
+            occ_flag = 1.0 if (self.occupied_start_minute <= mod <= self.occupied_end_minute) else 0.0
+            obs_parts.append(occ_flag)
 
-        # trend features (from history)
-        if self.include_trend_60m or self.include_trend_15m:
-            feats += self._trend_deltas(abs_minute, room_temp, outside_temp)
+        # Per-zone: Current temp + trends
+        for zone in self.ZONES:
+            current_temp = zone_temps_dict.get(zone, np.nan)
+            obs_parts.append(current_temp)
 
-        return np.asarray(feats, dtype=np.float32), occupied
+            # Trends (adapt your _get_temp_trend logic to use self._zone_hist[zone])
+            if self.include_trend_60m:
+                dTzone_60m = self._get_temp_trend(zone, abs_minute, 60)  # Implement _get_temp_trend as per my prev response
+                obs_parts.append(dTzone_60m)
+            if self.include_trend_15m:
+                dTzone_15m = self._get_temp_trend(zone, abs_minute, 15)
+                obs_parts.append(dTzone_15m)
+
+        return np.asarray(obs_parts, dtype=np.float32), self._is_occupied(mod)  # Return obs and occupied
+    
+    def _get_temp_trend(self, zone_name, current_minute, minutes_back):
+        """
+        Approximate temperature change over the last `minutes_back` minutes.
+        Returns 0 or NaN if not enough history.
+        """
+        hist = self._zone_hist[zone_name]
+        if len(hist) < 2:
+            return 0.0
+
+        # Find oldest entry within the window
+        target_minute = current_minute - minutes_back
+        past_temp = None
+        for abs_min, temp in reversed(hist):  # go backwards
+            if abs_min <= target_minute:
+                past_temp = temp
+                break
+
+        if past_temp is None or np.isnan(past_temp) or np.isnan(hist[-1][1]):
+            return 0.0
+
+        return hist[-1][1] - past_temp  # current - past
 
     # ---- action mapping / penalties ----
     def _coerce_action(self, act) -> float:
@@ -408,20 +449,44 @@ class RLController:
         if not self._ensure_ready(state):
             return
 
-        room_temp = self.api.exchange.get_variable_value(state, self.room_temp_handle)
+        # 1. Get current temperatures for ALL controlled zones (as dict: zone → temp)
+        zone_temps = {}
+        for zone in self.ZONES:
+            handle = self.room_temp_handles.get(zone, -1)
+            if handle == -1:
+                print(f"[WARN] Invalid handle for zone {zone} - skipping")
+                continue
+            temp = self.api.exchange.get_variable_value(state, handle)
+            zone_temps[zone] = temp if temp is not None else np.nan  # Handle missing/NaN safely
+
+        # 2. Get outside temperature (shared)
         outside_temp = self.api.exchange.get_variable_value(state, self.outside_temp_handle)
+        if outside_temp is None:
+            outside_temp = np.nan
+
+        # 3. Get time information
         doy, mod, abs_minute = self._get_time_index(state)
 
-        # update history buffer BEFORE building obs (so the 15/60-min lookups can find older data)
-        self._push_history(abs_minute, room_temp, outside_temp)
+        # 4. Update history buffers BEFORE building observation
+        #    - Per-zone history (adapt your _push_history to loop or make per-zone calls)
+        for zone in self.ZONES:
+            self._push_history(abs_minute, zone_temps[zone], outside_temp=None, zone=zone)  # See notes below on adapting _push_history
 
-        obs, occupied = self._make_obs(room_temp, outside_temp, doy, mod, abs_minute)
+        #    - Outside air history (shared)
+        self._push_history(abs_minute, None, outside_temp, zone=None)  # Separate call for outside
+
+        # 5. Build concatenated observation vector (shared + per-zone)
+        obs, occupied = self._make_obs_multi_zone(zone_temps, outside_temp, doy, mod, abs_minute)  # New multi-zone version (see below)
+
+        # ────────────────────────────────────────────────────────────────
+        # The rest of your callback (previous transition, action, setpoint update)
+        # ────────────────────────────────────────────────────────────────
 
         # Finalize last transition
         if self._prev_obs is not None and self._prev_act is not None and self._pending_rew is not None:
             self.rollout_writer.append(
                 obs=self._prev_obs,
-                act=np.asarray([self._prev_act], dtype=np.float32),
+                act=np.asarray([self._prev_act], dtype=np.float32),  # Now a vector if multi-zone
                 rew=float(self._pending_rew),
                 next_obs=obs,
                 done=0.0,
@@ -436,31 +501,40 @@ class RLController:
         self._prev_day_of_year = None
         self._prev_minute_of_day = None
 
-        # Policy action (normalized)
-        obs_for_policy = obs if self._is_torch_policy else np.asarray([room_temp, outside_temp], dtype=np.float32)
+        # Policy action (normalized) - now a vector [num_zones] if multi-zone
+        obs_for_policy = obs if self._is_torch_policy else np.asarray([room_temp, outside_temp], dtype=np.float32)  # Update for multi-zone if needed
         
-        a_norm_raw = self.rl_model.get_action(obs)
+        a_norm_raw = self.rl_model.get_action(obs_for_policy)  # Outputs vector [num_zones] - see notes below
 
         explore_noise = 0.1  # Or make configurable via env var/self.cfg
-        noise = np.random.normal(0, explore_noise)
+        noise = np.random.normal(0, explore_noise, size=len(self.ZONES))  # Vector noise
         a_norm_noisy = a_norm_raw + noise
 
-        a_norm = self._coerce_action(a_norm_noisy)
+        a_norm = self._coerce_action(a_norm_noisy)  # Vector version - adapt if needed
 
-        heat_sp, cool_sp, center_sp = self._map_action_to_setpoints(a_norm, occupied)
+        # Map actions to setpoints and apply per zone
+        for i, zone in enumerate(self.ZONES):
+            heat_sp, cool_sp, center_sp = self._map_action_to_setpoints(a_norm[i], occupied)  # Per-action mapping
 
-        if self.step_count % 50 == 0:
-            print(f"[dbg begin timestep] a_norm_raw={a_norm_raw} act={a_norm} obs0={obs[0]:.2f} obs1={obs[1]:.2f}  center_sp={center_sp:.2f} heat={heat_sp:.2f} cool={cool_sp:.2f}")
+            if self.step_count % 50 == 0:
+                fixed = os.environ.get("ANDRUIX_FIXED_SP_C")
+                print(f"[dbg] Zone {zone}: fixed={fixed} a_norm_raw={a_norm_raw[i]} act={a_norm[i]} obs0={obs[0]:.2f} obs1={obs[1]:.2f}")
 
-        self.api.exchange.set_actuator_value(state, self.heat_sp_handle, heat_sp)
-        self.api.exchange.set_actuator_value(state, self.cool_sp_handle, cool_sp)
+            if self.dbg_count < 10:
+                print(f"[dbg] Zone {zone}: a_norm_raw={a_norm_raw[i]:.4f} a_norm={a_norm[i]:.4f} center_sp={center_sp:.2f} heat={heat_sp:.2f} cool={cool_sp:.2f}")
+                self.dbg_count += 1
 
-        self._last_heat_sp = heat_sp
-        self._last_cool_sp = cool_sp
-        self._last_center_sp = center_sp
+            # Set actuators per zone
+            self.api.exchange.set_actuator_value(state, self.heat_sp_handles[zone], heat_sp)
+            self.api.exchange.set_actuator_value(state, self.cool_sp_handles[zone], cool_sp)
+
+            # Store last values per zone (adapt your _last_* to dicts if needed)
+            self._last_heat_sp[zone] = heat_sp
+            self._last_cool_sp[zone] = cool_sp
+            self._last_center_sp[zone] = center_sp
 
         self._prev_obs = obs
-        self._prev_act = a_norm
+        self._prev_act = a_norm  # Now the full vector
         self._prev_day_of_year = doy
         self._prev_minute_of_day = mod
 
@@ -470,6 +544,7 @@ class RLController:
 
         confirmed_heat = self.api.exchange.get_actuator_value(state, self.heat_sp_handle)
         confirmed_cool = self.api.exchange.get_actuator_value(state, self.cool_sp_handle)
+        outside_temp = self.api.exchange.get_variable_value(state, self.outside_temp_handle)
         raw_val = self.api.exchange.get_meter_value(state, self.facility_elec_meter_handle)
 
         if raw_val == 0.0 and self.api.exchange.api_error_flag(state):
@@ -477,7 +552,7 @@ class RLController:
             return
         
         if self.step_count % 10 == 0:  # Your suggested frequency
-            print(f"[verify_end_timestep] Set heat_end_confirmed={confirmed_heat:.2f}; cool_end_confirmed={confirmed_cool:.2f}")
+            print(f"[verify_end_timestep] Set heat_end_confirmed={confirmed_heat:.2f}; cool_end_confirmed={confirmed_cool:.2f}, outside_temp={outside_temp:.2f}")
 
         delta = 0.0
         if self.last_meter_val is not None:
@@ -549,7 +624,7 @@ def parse_args():
     p.add_argument("--idf", default=os.environ.get("EPLUS_IDF", "/home/guser/models/IECC_OfficeMedium_STD2021_Denver_RL_HIGH_ENERGY.idf"))
     p.add_argument("--epw", default=os.environ.get("EPLUS_EPW", "/home/guser/weather/5B_USA_CO_BOULDER.epw"))
     p.add_argument("--outdir", default=os.environ.get("EPLUS_OUTDIR", "/home/guser/results/"))
-    p.add_argument("--zone", default=os.environ.get("EPLUS_ZONE", "PERIMETER_BOT_ZN_3"))
+    p.add_argument("--zones", default=os.environ.get("EPLUS_ZONE", "PERIMETER_BOT_ZN_3"))
     p.add_argument("--energy-meter", default=os.environ.get("EPLUS_METER", "Electricity:Building"))
     p.add_argument("--dump-api-csv", action="store_true", default=os.environ.get("EPLUS_DUMP_API_CSV", "1") == "1")
     p.add_argument("--rollout-dir", default=os.environ.get("ROLLOUT_DIR", "/home/guser/rollouts"))
@@ -620,7 +695,7 @@ def main():
     controller = RLController(
         api,
         state,
-        zone_name=args.zone,
+        zone_names=args.zones,
         outdir=outdir,
         energy_meter_name=args.energy_meter,
         rollout_dir=Path(args.rollout_dir),
