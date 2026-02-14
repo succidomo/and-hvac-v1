@@ -236,7 +236,7 @@ class RLController:
         self.outside_temp_handle = self.api.exchange.get_variable_handle(state, "Site Outdoor Air Drybulb Temperature", "Environment")
         self.facility_elec_meter_handle = self.api.exchange.get_meter_handle(state, self.energy_meter_name)
 
-        for zone in self.zones:
+        for zone in self.ZONES:
             self.heat_sp_handles[zone] = self.api.exchange.get_actuator_handle(state, "Zone Temperature Control", "Heating Setpoint", zone)
             self.cool_sp_handles[zone] = self.api.exchange.get_actuator_handle(state, "Zone Temperature Control", "Cooling Setpoint", zone)
             self.room_temp_handles[zone] = self.api.exchange.get_variable_handle(state, "Zone Mean Air Temperature", zone)
