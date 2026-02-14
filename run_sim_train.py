@@ -250,8 +250,6 @@ class RLController:
             "room_temp_handle": self.room_temp_handles,
             "outside_temp_handle": self.outside_temp_handle,
             f"meter({self.energy_meter_name})": self.facility_elec_meter_handle,
-            "heat_sp_handle": self.heat_sp_handle,
-            "cool_sp_handle": self.cool_sp_handle,
         }.items() if h == -1]
 
         self.init_attempts += 1
