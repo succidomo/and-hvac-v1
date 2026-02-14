@@ -170,9 +170,9 @@ class RLController:
         self.handles_ready = False
         self.api_dumped = False
         self.facility_elec_meter_handle = -1
-        self.heat_sp_handle = -1
-        self.cool_sp_handle = -1
-        self.room_temp_handles = {}          # zone_name → handle
+        self.heat_sp_handles = {}
+        self.cool_sp_handles = {}
+        self.room_temp_handles = {}         # zone_name → handle
         self.outside_temp_handle = None      # shared
 
         self.last_meter_val = None
@@ -241,6 +241,10 @@ class RLController:
             self.cool_sp_handles[zone] = self.api.exchange.get_actuator_handle(state, "Zone Temperature Control", "Cooling Setpoint", zone)
             self.room_temp_handles[zone] = self.api.exchange.get_variable_handle(state, "Zone Mean Air Temperature", zone)
 
+            # Debug: Warn if any handle invalid
+            if self.heat_sp_handles[zone] == -1 or self.cool_sp_handles[zone] == -1 or self.room_temp_handles[zone] == -1:
+                print(f"[WARN] Invalid handle for zone {zone} - check zone name/spelling in IDF")
+        
         missing = [name for name, h in {
             "room_temp_handle": self.room_temp_handle,
             "outside_temp_handle": self.outside_temp_handle,
