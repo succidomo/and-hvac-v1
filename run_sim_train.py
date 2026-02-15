@@ -508,14 +508,20 @@ class RLController:
             avg_room_temp = np.nanmean(list(zone_temps.values())) if zone_temps else np.nan
             obs_for_policy = np.asarray([avg_room_temp, outside_temp], dtype=np.float32)
 
-        a_norm_raw = self.rl_model.get_action(obs_for_policy)  # Outputs vector [num_zones] - see notes below
+        # Get raw policy action (should already be vector if multi-zone policy)
+        a_norm_raw = self.rl_model.get_action(obs_for_policy)
 
-        explore_noise = 0.1  # Or make configurable via env var/self.cfg
-        noise = np.random.normal(0, explore_noise, size=len(self.ZONES))  # Vector noise
-        a_norm_noisy = a_norm_raw + noise
+        # Optional: Add small exploration noise in worker (can be turned off later)
+        # If you want to keep noise here, make sure it's added to a vector
+        if len(self.ZONES) > 1:
+            # Assume a_norm_raw is already array-like
+            explore_noise = 0.1
+            noise = np.random.normal(0, explore_noise, size=len(self.ZONES))
+            a_norm = a_norm_raw + noise
+        else:
+            a_norm = a_norm_raw  # scalar for 1 zone
 
-        a_norm = self._coerce_action(a_norm_noisy)  # Vector version - adapt if needed
-
+        # Debug to confirm shape/type
         print(f"[action_dbg] Type of a_norm: {type(a_norm)}, Value: {a_norm}, Shape: {np.shape(a_norm) if hasattr(a_norm, 'shape') else 'no shape (scalar)'}")
 
         # Map actions to setpoints and apply per zone
