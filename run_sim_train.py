@@ -49,7 +49,6 @@ class RLController:
         energy_meter_name: str = "Electricity:Building",
         dump_api_available_csv: bool = True,
         debug_meter_every_n_steps: int = 20,
-        reward_mode: str = "delta",
         reward_scale: float = 3.6e6,
 
         # --- Observation features ---
@@ -123,7 +122,6 @@ class RLController:
         self.energy_meter_name = energy_meter_name.split(",")[0].strip()
         self.dump_api_available_csv = dump_api_available_csv
         self.debug_meter_every_n_steps = debug_meter_every_n_steps
-        self.reward_mode = (reward_mode or "delta").lower()
         self.reward_scale = float(reward_scale) if reward_scale else 1.0
 
         # ---- Action mapping config ----
@@ -175,7 +173,6 @@ class RLController:
         self.room_temp_handles = {}         # zone_name → handle
         self.outside_temp_handle = None      # shared
 
-        self.last_meter_val = None
         self.step_count = 0
         self.dbg_count = 0
         self.init_attempts = 0
@@ -259,7 +256,6 @@ class RLController:
             return
 
         self.handles_ready = True
-        self.last_meter_val = None
         self._hist.clear()
         print(f"[init] Handles resolved ✔ meter='{self.energy_meter_name}' obs_dim={self.obs_dim}")
 
@@ -520,6 +516,8 @@ class RLController:
 
         a_norm = self._coerce_action(a_norm_noisy)  # Vector version - adapt if needed
 
+        print(f"[action_dbg] Type of a_norm: {type(a_norm)}, Value: {a_norm}, Shape: {np.shape(a_norm) if hasattr(a_norm, 'shape') else 'no shape (scalar)'}")
+
         # Map actions to setpoints and apply per zone
         for i, zone in enumerate(self.ZONES):
             heat_sp, cool_sp, center_sp = self._map_action_to_setpoints(a_norm[i], occupied)  # Per-action mapping
@@ -581,19 +579,10 @@ class RLController:
 
         # 4. Meter reading (shared — facility or HVAC)
         raw_val = self.api.exchange.get_meter_value(state, self.facility_elec_meter_handle)
-        if raw_val == 0.0 and self.api.exchange.api_error_flag(state):
-            print("[meter] api_error_flag=True reading meter; handle likely invalid")
-            return
 
-        # Delta calculation (same as before)
-        delta = 0.0
-        if self.last_meter_val is not None:
-            delta = float(raw_val) - float(self.last_meter_val)
-            if delta < 0.0:
-                delta = 0.0
-        self.last_meter_val = float(raw_val)
+        # Meter value for reward (timestep-reported meters already represent the energy for this timestep)
+        use_val = float(raw_val)
 
-        use_val = float(raw_val) if self.reward_mode == "raw" else float(delta)
         scale = self.reward_scale if self.reward_scale != 0.0 else 1.0
         energy_kwh = use_val / scale
 
@@ -644,7 +633,7 @@ class RLController:
         # 8. Step count & debug print (updated for multi-zone summary)
         self.step_count += 1
         if self.debug_meter_every_n_steps and (self.step_count % self.debug_meter_every_n_steps == 0):
-            meter_str = f"raw={raw_val:.2f}" if self.reward_mode == "raw" else f"delta={delta:.2f}"
+            meter_str = f"raw={raw_val:.2f}"
             avg_tz = np.nanmean(list(zone_temps.values())) if zone_temps else np.nan
             print(
                 f"[step {self.step_count}] {meter_str} kWh={energy_kwh:.4f} "
@@ -692,7 +681,6 @@ def parse_args():
     p.add_argument("--policy-kind", default=os.environ.get("ANDRUIX_POLICY_KIND", "torch"), choices=["simple", "torch"])
     p.add_argument("--policy-path", default=os.environ.get("ANDRUIX_POLICY_PATH", os.environ.get("POLICY_PATH", "")))
 
-    p.add_argument("--reward-mode", default=os.environ.get("ANDRUIX_REWARD_MODE", "delta"), choices=["raw", "delta"])
     p.add_argument("--reward-scale", type=float, default=float(os.environ.get("ANDRUIX_REWARD_SCALE", "1000000.0")))
 
     # Observation feature toggles
@@ -760,7 +748,6 @@ def main():
         policy_kind=args.policy_kind,
         dump_api_available_csv=args.dump_api_csv,
         debug_meter_every_n_steps=1,
-        reward_mode=args.reward_mode,
         reward_scale=args.reward_scale,
 
         include_occ_flag=bool(args.include_occ_flag),
