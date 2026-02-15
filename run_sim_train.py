@@ -106,17 +106,17 @@ class RLController:
 
         # Compute obs_dim
         # base: Tzone, Toa, sin_tod, cos_tod => 4
-        obs_dim = 4
-        if self.include_doy_features:
-            obs_dim += 2
-        if self.include_occ_flag:
-            obs_dim += 1
+        obs_dim = len(self.ZONES) + 1 + 2  # zone temps + outside + sin/cos(tod)
         if self.include_trend_60m:
             obs_dim += 2
         if self.include_trend_15m:
             obs_dim += 2
-        self.obs_dim = obs_dim
-        self.act_dim = 1
+        if self.include_doy_features:
+            obs_dim += 2
+        if self.include_occ_flag:
+            obs_dim += 1
+        self.obs_dim = int(obs_dim)
+        self.act_dim = len(self.ZONES)
 
         # IMPORTANT: For get_meter_handle(), pass just the meter name (no ",hourly").
         self.energy_meter_name = energy_meter_name.split(",")[0].strip()
