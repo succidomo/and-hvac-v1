@@ -27,20 +27,21 @@ class SimpleRLModel:
         x = np.asarray(obs, dtype=np.float32).reshape(-1)
         n = self.num_zones
 
-        # Use average controlled-zone temperature as the feedback signal.
+        actions = np.zeros(n, dtype=np.float32)
+
+        # Per-zone proportional control in normalized action space
         if x.size >= n:
-            tz = x[:n]
-            tz_avg = float(np.nanmean(tz)) if np.isfinite(tz).any() else self.target_temp_c
+            tz = x[:n]  # per-zone temperatures
+            for i in range(n):
+                tz_i = float(tz[i]) if np.isfinite(tz[i]) else self.target_temp_c
+                err = self.target_temp_c - tz_i  # positive if too cold (raise setpoint)
+                a_i = float(np.clip(self.gain * err / 4.0, -1.0, 1.0))
+                actions[i] = a_i
         else:
-            tz_avg = self.target_temp_c
+            # Fallback: same default action for all
+            actions.fill(0.0)
 
-        # Simple proportional control in normalized action space:
-        # if tz_avg > target => action negative (lower center setpoint)
-        # if tz_avg < target => action positive (raise center setpoint)
-        err = self.target_temp_c - tz_avg
-        a = float(np.clip(self.gain * err / 4.0, -1.0, 1.0))
-
-        return np.full((n,), a, dtype=np.float32)
+        return actions
 
     def update(self, trajectory: dict) -> None:
         # no-op placeholder (kept for interface compatibility)

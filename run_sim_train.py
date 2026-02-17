@@ -370,20 +370,30 @@ class RLController:
         # 1) Zone temps in the provided zone order
         tz_list: list[float] = []
         for z in self.ZONES:
-            v = zone_temps_dict.get(z, np.nan)
-            try:
-                tz_list.append(float(v))
-            except Exception as e:
-                print(f"[make_obs_debug] err converting v: {v} to float, added nan to tz_list. zone: {z}, ex: {e.message}")
+            v = zone_temps_dict.get(z, None)
+            if v is None:
                 tz_list.append(float('nan'))
-                
+                print(f"[make_obs_bad] step={self.step_count} | zone={z} | missing value → NaN")
+                continue
+
+            try:
+                tz = float(v)
+                if not np.isfinite(tz):
+                    raise ValueError(f"non-finite value: {tz}")
+                tz_list.append(tz)
+            except (ValueError, TypeError) as e:
+                tz_list.append(float('nan'))
+                print(f"[make_obs_bad] step={self.step_count} | zone={z} | value={v!r} → NaN | error={str(e)}")
+
         obs_parts.extend(tz_list)
 
         # 2) Outside air temp
         try:
             toa = float(outside_temp)
-        except Exception:
-            print(f"[make_obs_debug] err converting toa: {toa} to float, toat as nan. ex: {e.message}")
+            if not np.isfinite(toa):
+                raise ValueError("non-finite Toa")
+        except (ValueError, TypeError) as e:
+            print(f"[make_obs_bad] Toa conversion failed  value={outside_temp!r}  error={str(e)}")
             toa = float('nan')
         obs_parts.append(toa)
 
@@ -401,7 +411,7 @@ class RLController:
             tz_avg = float(np.nanmean(tz_list))
         else:
             tz_avg = float('nan')
-            print(f"[make_obs_debug] tz_list was empty → returning NaN")
+            print(f"[make_obs_bad] tz_list was empty → returning NaN")
 
         obs_parts.extend(self._trend_deltas(abs_minute, tz_avg, toa))
 
