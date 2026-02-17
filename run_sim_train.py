@@ -373,14 +373,17 @@ class RLController:
             v = zone_temps_dict.get(z, np.nan)
             try:
                 tz_list.append(float(v))
-            except Exception:
+            except Exception as e:
+                print(f"[make_obs_debug] err converting v: {v} to float, added nan to tz_list. zone: {z}, ex: {e.message}")
                 tz_list.append(float('nan'))
+                
         obs_parts.extend(tz_list)
 
         # 2) Outside air temp
         try:
             toa = float(outside_temp)
         except Exception:
+            print(f"[make_obs_debug] err converting toa: {toa} to float, toat as nan. ex: {e.message}")
             toa = float('nan')
         obs_parts.append(toa)
 
@@ -394,7 +397,12 @@ class RLController:
         obs_parts.extend([sin_tod, cos_tod])
 
         # 4) Shared trend deltas using avg zone temp + outside temp
-        tz_avg = float(np.nanmean(tz_list)) if len(tz_list) else float('nan')
+        if len(tz_list) > 0:
+            tz_avg = float(np.nanmean(tz_list))
+        else:
+            tz_avg = float('nan')
+            print(f"[make_obs_debug] tz_list was empty → returning NaN")
+
         obs_parts.extend(self._trend_deltas(abs_minute, tz_avg, toa))
 
         # 5) Day-of-year sin/cos (optional)
@@ -502,7 +510,7 @@ class RLController:
         obs, occupied = self._make_obs_multi_zone(zone_temps, outside_temp, doy, mod, abs_minute)
 
         if self.step_count % 10 == 0:
-            print(f"[obs_debug] NaN source found in obs=={np.any(~np.isfinite(obs))}")
+            print(f"[obs_debug] IsAny Finite=={np.any(~np.isfinite(obs))}")
 
         # 6) Finalize previous transition (reward computed in end_system_timestep_callback)
         if self._prev_obs is not None and self._prev_act is not None and self._pending_rew is not None:
