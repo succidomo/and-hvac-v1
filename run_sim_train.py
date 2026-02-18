@@ -545,6 +545,9 @@ class RLController:
         
         a_norm = self._coerce_action_vec(a_raw, n=len(self.ZONES))
 
+        ar = np.asarray(a_raw)
+        an = np.asarray(a_norm)
+
         print(
             "[a_dbg]"
             f" a_raw(type={type(a_raw).__name__}, shape={ar.shape}, dtype={ar.dtype if hasattr(ar,'dtype') else 'n/a'})"
