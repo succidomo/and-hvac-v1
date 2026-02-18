@@ -520,7 +520,7 @@ class RLController:
         obs, occupied = self._make_obs_multi_zone(zone_temps, outside_temp, doy, mod, abs_minute)
 
         if self.step_count % 10 == 0:
-            print(f"[obs_debug] IsAny Finite=={np.any(~np.isfinite(obs))}")
+            print(f"[obs_debug] any_nonfinite={np.any(~np.isfinite(obs))}")
 
         # 6) Finalize previous transition (reward computed in end_system_timestep_callback)
         if self._prev_obs is not None and self._prev_act is not None and self._pending_rew is not None:
@@ -542,7 +542,21 @@ class RLController:
         explore_noise = float(os.environ.get('ANDRUIX_EXPLORE_NOISE', '0.0'))
         if explore_noise > 0.0:
             a_raw = np.asarray(a_raw, dtype=np.float32).reshape(-1) + np.random.normal(0.0, explore_noise, size=len(self.ZONES)).astype(np.float32)
+        
         a_norm = self._coerce_action_vec(a_raw, n=len(self.ZONES))
+
+        print(
+            "[a_dbg]"
+            f" a_raw(type={type(a_raw).__name__}, shape={ar.shape}, dtype={ar.dtype if hasattr(ar,'dtype') else 'n/a'})"
+            f" min={np.nanmin(ar):.4f} max={np.nanmax(ar):.4f} mean={np.nanmean(ar):.4f}"
+            f" any_nonfinite={np.any(~np.isfinite(ar))}"
+            f" sample={ar.reshape(-1)[:min(5, ar.size)]}"
+            " |"
+            f" a_norm(shape={an.shape}, dtype={an.dtype})"
+            f" min={np.nanmin(an):.4f} max={np.nanmax(an):.4f} mean={np.nanmean(an):.4f}"
+            f" any_nonfinite={np.any(~np.isfinite(an))}"
+            f" sample={an.reshape(-1)[:min(5, an.size)]}"
+        )
 
         # 8) Apply setpoints per zone
         for i, zone in enumerate(self.ZONES):
