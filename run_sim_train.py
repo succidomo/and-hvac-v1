@@ -160,7 +160,23 @@ class RLController:
             self.rl_model = SimpleRLModel(num_zones=len(self.ZONES))
 
         # TD3-style replay writer
-        self.rollout_writer = RolloutWriter(self.rollout_dir, self.rollout_id, obs_dim=self.obs_dim, act_dim=self.act_dim)
+        self.rollout_writer = RolloutWriter(
+            self.rollout_dir, 
+            self.rollout_id, 
+            obs_dim=self.obs_dim, 
+            act_dim=self.act_dim,
+            zones=self.ZONES,
+            start_mmdd=os.getenv("EPLUS_START_MMDD"),
+            end_mmdd=os.getenv("EPLUS_END_MMDD"),
+            reward_mode=os.getenv("ANDRUIX_REWARD_MODE"),
+            reward_scale=float(os.getenv("ANDRUIX_REWARD_SCALE", "0") or 0) or None,
+            obs_flags={
+                "include_occ": bool(int(os.getenv("ANDRUIX_OBS_OCC", "0"))),
+                "no_doy": bool(int(os.getenv("ANDRUIX_OBS_NO_DOY", "0"))),
+                "no_trend_15m": bool(int(os.getenv("ANDRUIX_OBS_NO_TREND_15M", "0"))),
+                "no_trend_60m": bool(int(os.getenv("ANDRUIX_OBS_NO_TREND_60M", "0"))),
+            },
+        )
 
         # Handle readiness / sentinels
         self.handles_ready = False
@@ -711,8 +727,8 @@ def parse_args():
     p.add_argument("--rollout-dir", default=os.environ.get("ROLLOUT_DIR", "/home/guser/rollouts"))
     p.add_argument("--rollout-id", default=os.environ.get("ROLLOUT_ID", str(uuid.uuid4())))
 
-    p.add_argument("--start-date", default=os.environ.get("EPLUS_START_DATE", ""))
-    p.add_argument("--end-date", default=os.environ.get("EPLUS_END_DATE", ""))
+    p.add_argument("--start-date", default=os.environ.get("EPLUS_START_MMDD", ""))
+    p.add_argument("--end-date", default=os.environ.get("EPLUS_END_MMDD", ""))
 
     p.add_argument("--policy-kind", default=os.environ.get("ANDRUIX_POLICY_KIND", "torch"), choices=["simple", "torch"])
     p.add_argument("--policy-path", default=os.environ.get("ANDRUIX_POLICY_PATH", os.environ.get("POLICY_PATH", "")))

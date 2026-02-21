@@ -11,6 +11,7 @@ Keep this separate so the simulation runner can stay focused on callbacks + cont
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
 from pathlib import Path
 import json
 import numpy as np
@@ -22,14 +23,49 @@ class RolloutMeta:
     n_steps: int
     episode_return: float
 
+    zones: List[str]
+    obs_dim: int
+    act_dim: int
+
+    start_mmdd: Optional[str] = None
+    end_mmdd: Optional[str] = None
+
+    reward_mode: Optional[str] = None
+    reward_scale: Optional[float] = None
+
+    obs_flags: Optional[Dict[str, Any]] = None
+    policy_fingerprint: Optional[str] = None
+
 
 class RolloutWriter:
-    def __init__(self, rollout_dir: str | Path, rollout_id: str, obs_dim: int, act_dim: int):
+    def __init__(
+        self, 
+        rollout_dir: str | Path, 
+        rollout_id: str, 
+        obs_dim: int, 
+        act_dim: int,
+        *,
+        zones: Optional[List[str]] = None,
+        start_mmdd: Optional[str] = None,
+        end_mmdd: Optional[str] = None,
+        reward_mode: Optional[str] = None,
+        reward_scale: Optional[float] = None,
+        obs_flags: Optional[Dict[str, Any]] = None,
+        policy_fingerprint: Optional[str] = None,
+    ):
         self.rollout_dir = Path(rollout_dir)
         self.rollout_dir.mkdir(parents=True, exist_ok=True)
         self.rollout_id = rollout_id
         self.obs_dim = int(obs_dim)
         self.act_dim = int(act_dim)
+
+        self.zones = list(zones) if zones else []
+        self.start_mmdd = start_mmdd
+        self.end_mmdd = end_mmdd
+        self.reward_mode = reward_mode
+        self.reward_scale = reward_scale
+        self.obs_flags = dict(obs_flags) if obs_flags else None
+        self.policy_fingerprint = policy_fingerprint
 
         self.obs: list[np.ndarray] = []
         self.act: list[np.ndarray] = []
@@ -116,8 +152,19 @@ class RolloutWriter:
             rollout_id=self.rollout_id,
             n_steps=int(len(payload["rew"])),
             episode_return=float(np.sum(payload["rew"])) if len(payload["rew"]) else 0.0,
+            zones=list(self.zones),
+            obs_dim=int(self.obs_dim),
+            act_dim=int(self.act_dim),
+            start_mmdd=self.start_mmdd,
+            end_mmdd=self.end_mmdd,
+            reward_mode=self.reward_mode,
+            reward_scale=self.reward_scale,
+            obs_flags=self.obs_flags,
+            # optional: policy_fingerprint=self.policy_fingerprint,
         )
-        (self.rollout_dir / f"rollout_{self.rollout_id}.json").write_text(json.dumps(meta.__dict__, indent=2))
-        # Write marker last
+        (self.rollout_dir / f"rollout_{self.rollout_id}.json").write_text(
+            json.dumps(meta.__dict__, indent=2)
+        )
+
         (self.rollout_dir / f"rollout_{self.rollout_id}.done").write_text("ok\n")
         return out_npz

@@ -46,7 +46,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 
@@ -335,56 +335,54 @@ class WorkerSpec:
 
 
 def docker_run_worker(spec: WorkerSpec) -> str:
-    """
-    Launches one rollout container. Returns container_id.
-    Customize env vars/args to match your run_sim_base.py entrypoint.
-    """
-    # Where the worker will write
     rollout_dir = spec.shared_root / "rollouts" / "inbox" / spec.rollout_id
     rollout_dir.mkdir(parents=True, exist_ok=True)
 
     env = {
-        "ANDRUIX_ROLLOUT_ID": spec.rollout_id,
+        "ROLLOUT_ID": spec.rollout_id,
         "ANDRUIX_ROLLOUT_DAYS": str(spec.rollout_days),
         "ANDRUIX_SEED": str(spec.seed),
-        # Worker should read policy from here (inside container)
         "ANDRUIX_POLICY_PATH": "/shared/policy/latest/policy.pt",
-        # Worker should write here (inside container)
-        "ANDRUIX_OUT_DIR": f"/shared/rollouts/inbox/{spec.rollout_id}"
+        "ROLLOUT_DIR": f"/shared/rollouts/inbox/{spec.rollout_id}",
     }
     env.update(spec.extra_env or {})
 
+    extra = spec.extra_env or {}
+    zones = extra.get("EPLUS_ZONE")
+    start = extra.get("EPLUS_START_MMDD")
+    end   = extra.get("EPLUS_END_MMDD")
+    if not zones:
+        raise ValueError("EPLUS_ZONE must be provided (comma-separated zone list).")
+    if not start or not end:
+        raise ValueError("EPLUS_START_MMDD and EPLUS_END_MMDD are required (e.g., 07/15, 09/22).")
+
     cmd = ["docker", "run", "-d", "--name", f"andruix_rollout_{spec.rollout_id}", "--label", f"andruix.rollout_id={spec.rollout_id}"]
-    # Resource caps (optional)
     if spec.cpus is not None:
         cmd += ["--cpus", str(spec.cpus)]
     if spec.mem is not None:
         cmd += ["--memory", spec.mem]
 
-    # Mount shared root
     cmd += ["-v", f"{str(spec.shared_root)}:/shared"]
 
-    # Env vars
     for k, v in env.items():
         cmd += ["-e", f"{k}={v}"]
 
-    # Image
     cmd += [spec.image]
 
     cmd += [
         "--rollout-id", spec.rollout_id,
         "--rollout-dir", f"/shared/rollouts/inbox/{spec.rollout_id}",
         "--outdir", f"/shared/results/{spec.rollout_id}",
-        "--start-date", spec.extra_env["EPLUS_START_MMDD"],
-        "--end-date", spec.extra_env["EPLUS_END_MMDD"],
-        "--policy-kind", spec.extra_env.get("ANDRUIX_POLICY_KIND", "torch"),
-        "--reward-scale", spec.extra_env.get("ANDRUIX_REWARD_SCALE", "3600000"),
+        "--start-date", start,
+        "--end-date", end,
+        "--policy-kind", extra.get("ANDRUIX_POLICY_KIND", "torch"),
+        "--reward-scale", extra.get("ANDRUIX_REWARD_SCALE", "3600000"),
         "--comfort-weight", "1.0",
         "--slew-weight", "0.01",
         "--energy-meter", "Electricity:HVAC",
-        "--zones", "PERIMETER_BOT_ZN_3,CORE_BOTTOM,PERIMETER_BOT_ZN_1,PERIMETER_BOT_ZN_2,PERIMETER_BOT_ZN_4"
+        "--zones", zones,
+        "--policy-path", "/shared/policy/latest/policy.pt",
     ]
-
 
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
@@ -443,7 +441,15 @@ def list_completed_rollouts(inbox_dir: Path) -> List[Path]:
 
     return sorted(rdirs)
 
-
+def load_rollout_meta_for_npz(npz_path: Path) -> dict:
+    # rollout_<id>.npz -> rollout_<id>.json
+    meta_path = npz_path.with_suffix(".json")
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text())
+    except Exception:
+        return {}
 
 def load_traj_npz(traj_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load a rollout npz safely (ensures file handle is closed; important on Windows)."""
@@ -454,6 +460,10 @@ def load_traj_npz(traj_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
         next_obs = data["next_obs"]
         done = data["done"]
     return obs, act, rew, next_obs, done
+
+def load_traj_extras_npz(traj_path: Path) -> Dict[str, Any]:
+    with np.load(traj_path) as data:
+        return {k: data[k] for k in ("day_of_year","minute_of_day","energy_meter") if k in data.files}
 
 
 # -----------------------------
@@ -499,6 +509,9 @@ class Orchestrator:
         self.azure_storage_container = azure_storage_container
         self.azure_connection_string = azure_connection_string
         self.tb_run_name = tb_run_name or f"run-{int(time.time())}"
+        self.act_dim = act_dim
+        self.obs_dim = obs_dim
+
 
         self.blob_client = None
         if azure_storage_account and azure_connection_string:
@@ -708,12 +721,34 @@ class Orchestrator:
 
             try:
                 obs, act, rew, next_obs, done = load_traj_npz(npz_path)
+                meta = load_rollout_meta_for_npz(npz_path)
+                zones = meta.get("zones") or []
+
+                # If zones exist, verify act_dim matches len(zones)
+                if zones and act.ndim == 2 and act.shape[1] != len(zones):
+                    raise ValueError(f"{rdir.name}: act_dim {act.shape[1]} != len(zones) {len(zones)}")
+
+                # If orchestrator has an expected zone list, verify exact match (ordering matters!)
+                expected = self.extra_env.get("EPLUS_ZONE", "")
+                expected_zones = [z.strip() for z in expected.split(",") if z.strip()]
+                if zones and expected_zones and zones != expected_zones:
+                    raise ValueError(f"{rdir.name}: zones mismatch expected={expected_zones} got={zones}")
+
+                # After loading obs/act...
+                if act.ndim == 2 and obs.ndim == 2:
+                    if act.shape[0] != obs.shape[0]:
+                        raise ValueError(f"timestep mismatch: act={act.shape} obs={obs.shape}")
+                    if act.shape[1] != self.act_dim:
+                        raise ValueError(f"act_dim mismatch: act has {act.shape[1]} but args.act_dim={self.act_dim}")
+                    if obs.shape[1] != self.obs_dim:
+                        raise ValueError(f"obs_dim mismatch: obs has {obs.shape[1]} but args.obs_dim={self.obs_dim}")
 
                 # act debug delete me later
-                act_mean = float(np.mean(act))
-                act_std  = float(np.std(act))
-                act_min  = float(np.min(act))
-                act_max  = float(np.max(act))
+                act_arr = np.asarray(act)
+                act_mean = float(np.mean(act_arr))
+                act_std  = float(np.std(act_arr))
+                act_min  = float(np.min(act_arr))
+                act_max  = float(np.max(act_arr))
 
                 rew_sha = _sha1(rew)
                 act_sha = _sha1(act)
