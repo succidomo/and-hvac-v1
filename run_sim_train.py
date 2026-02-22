@@ -10,7 +10,7 @@ from pyenergyplus.api import EnergyPlusAPI
 
 from eplus_runperiod_utils import rewrite_first_runperiod
 from andruix_policy_model import TorchPolicyModel
-from andruix_rollout_writer import RolloutWriter
+from andruix_rollout_writer import RolloutWriter, WorkerTimeseriesWriter
 from andruix_simple_model import SimpleRLModel
 
 
@@ -177,6 +177,16 @@ class RLController:
                 "no_trend_60m": bool(int(os.getenv("ANDRUIX_OBS_NO_TREND_60M", "0"))),
             },
         )
+
+        # Per-worker debug timeseries writer (parquet/csv) keyed by rollout_id
+        self.ts_writer = WorkerTimeseriesWriter(
+            out_dir=self.outdir,          # writes to /shared/results/<rollout_id>/ (your --outdir)
+            rollout_id=self.rollout_id,
+            zones=self.ZONES,
+            policy_fingerprint=os.getenv("ANDRUIX_POLICY_SHA") or None,
+            image_tag=os.getenv("ANDRUIX_IMAGE_TAG") or None,
+        )
+        self._ts_pending = None  # begin-callback stash; flushed in end-callback
 
         # Handle readiness / sentinels
         self.handles_ready = False
@@ -577,9 +587,19 @@ class RLController:
             f" sample={an.reshape(-1)[:min(5, an.size)]}"
         )
 
+        # Prepare dicts for timeseries logging
+        zone_actions_norm = {z: float(a_norm[i]) for i, z in enumerate(self.ZONES)}
+        zone_heat_sp = {}
+        zone_cool_sp = {}
+
         # 8) Apply setpoints per zone
         for i, zone in enumerate(self.ZONES):
             heat_sp, cool_sp, center_sp = self._map_action_to_setpoints(float(a_norm[i]), occupied)
+
+            # Save for timeseries
+            zone_heat_sp[zone] = float(heat_sp)
+            zone_cool_sp[zone] = float(cool_sp)
+
             self.api.exchange.set_actuator_value(state, self.heat_sp_handles[zone], heat_sp)
             self.api.exchange.set_actuator_value(state, self.cool_sp_handles[zone], cool_sp)
 
@@ -595,6 +615,19 @@ class RLController:
         self._prev_act = a_norm
         self._prev_day_of_year = doy
         self._prev_minute_of_day = mod
+
+        # Timeseries: stash begin-step info, flush in end_system_timestep_callback
+        self._ts_pending = {
+            "step_idx": int(self.step_count),          # aligns with reward/energy computed at end of this timestep
+            "day_of_year": doy,
+            "minute_of_day": mod,
+            "outside_air_c": float(outside_temp),
+            "zone_temps_c": {k: float(v) for k, v in zone_temps.items()},
+            "zone_setpoints_heat_c": zone_heat_sp,
+            "zone_setpoints_cool_c": zone_cool_sp,
+            "zone_actions_norm": zone_actions_norm,
+            "occupied": 1.0 if occupied else 0.0,      # optional scalar
+        }
 
     def end_system_timestep_callback(self, state):
         if not self._ensure_ready(state):
@@ -697,6 +730,30 @@ class RLController:
         self._pending_rew = rew
         self._pending_energy = energy_kwh
 
+                # Timeseries: flush the pending row now that energy + reward are known
+        if self._ts_pending is not None:
+            p = self._ts_pending
+            self.ts_writer.append_step(
+                step_idx=p["step_idx"],
+                day_of_year=p["day_of_year"],
+                minute_of_day=p["minute_of_day"],
+                outside_air_c=p["outside_air_c"],
+                hvac_energy_kwh=float(energy_kwh),
+                reward=float(rew),
+                zone_temps_c=p["zone_temps_c"],
+                zone_setpoints_heat_c=p["zone_setpoints_heat_c"],
+                zone_setpoints_cool_c=p["zone_setpoints_cool_c"],
+                zone_actions_norm=p["zone_actions_norm"],
+                extra_scalars={
+                    "occupied": float(p.get("occupied", 1.0)),
+                    # easy future adds:
+                    # "comfort_pen": float(comfort_pen),
+                    # "hard_pen": float(hard_pen),
+                    # "slew_pen": float(slew_pen),
+                },
+            )
+            self._ts_pending = None
+
     def finalize_and_write_rollout(self):
         if self._prev_obs is not None and self._prev_act is not None and self._pending_rew is not None:
             self.rollout_writer.append(
@@ -714,6 +771,9 @@ class RLController:
 
         out_npz = self.rollout_writer.write()
         print(f"[rollout] wrote {out_npz}")
+
+        ts_path = self.ts_writer.write()
+        print(f"[timeseries] wrote {ts_path}")
 
 
 def parse_args():
