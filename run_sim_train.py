@@ -1,43 +1,63 @@
 import argparse
 import os
 from pathlib import Path
-import time
 
 import numpy as np
-import json
 import uuid
+from collections import deque
+
 from pyenergyplus.api import EnergyPlusAPI
 
-import torch
-from eplus_runperiod_utils import parse_mmdd, rewrite_first_runperiod
+from eplus_runperiod_utils import rewrite_first_runperiod
 from andruix_policy_model import TorchPolicyModel
-from andruix_rollout_writer import RolloutWriter
+from andruix_rollout_writer import RolloutWriter, WorkerTimeseriesWriter
 from andruix_simple_model import SimpleRLModel
 
 
 class RLController:
+    """EnergyPlus callback controller.
+
+    Step 1.2 change (trend features):
+      - Observation includes time features AND short-horizon *trend* features from past measurements
+        (no external forecast required).
+
+    Default obs (all toggles ON):
+      [
+        Tzone,
+        Toa,
+        sin(tod), cos(tod),
+        sin(doy), cos(doy),
+        occ_flag,
+        dTzone_60m, dToa_60m,
+        dTzone_15m, dToa_15m,
+      ]
+
+    NOTE: Existing torch policies trained with earlier obs_dim will NOT be compatible.
+          Start a fresh training run with orchestrator --obs-dim matching this worker.
+    """
+
     def __init__(
         self,
         api: EnergyPlusAPI,
         state,
-        zone_name: str,
+        zone_names: str,
         outdir: Path,
         rollout_dir: Path,
         rollout_id: str,
         policy_path: str | os.PathLike | None = None,
-        policy_kind: str = "simple",
+        policy_kind: str = "torch",
         energy_meter_name: str = "Electricity:Building",
         dump_api_available_csv: bool = True,
         debug_meter_every_n_steps: int = 20,
-        reward_mode: str = "delta",
-        reward_scale: float = 1e6,
+        reward_scale: float = 3.6e6,
+
+        # --- Observation features ---
+        include_occ_flag: bool = True,
+        include_doy_features: bool = True,
+        include_trend_60m: bool = True,
+        include_trend_15m: bool = True,
 
         # --- Action semantics (single action -> thermostat centerline) ---
-        # We treat the policy output as a normalized action a \in [-1, 1].
-        # We map it to a thermostat "centerline" temperature, then derive
-        # heating/cooling setpoints via a deadband. This avoids the current
-        # behavior of setting *both* heating and cooling setpoints to the same
-        # absolute value.
         sp_center_min_occ: float = 21.0,
         sp_center_max_occ: float = 24.0,
         sp_center_min_unocc: float = 18.0,
@@ -63,20 +83,43 @@ class RLController:
     ):
         self.api = api
         self.state = state
-        self.ZONE = zone_name
+        self.ZONES = [z.strip() for z in str(zone_names).split(',') if z.strip()]
         self.outdir = Path(outdir)
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.rollout_dir = Path(rollout_dir)
         self.rollout_dir.mkdir(parents=True, exist_ok=True)
         self.rollout_id = rollout_id
 
+        # Observation config
+        self.include_occ_flag = bool(include_occ_flag)
+        self.include_doy_features = bool(include_doy_features)
+        self.include_trend_60m = bool(include_trend_60m)
+        self.include_trend_15m = bool(include_trend_15m)
+
+        # History buffer (absolute simulation minutes -> temps)
+        self._hist = deque(maxlen=3000)
+
+        # Compute obs_dim / act_dim (Path A)
+        # obs = [Tz_1..Tz_N] + [Toa] + [sin_tod, cos_tod] + trends + [sin_doy, cos_doy] + [occ_flag]
+        n_z = len(self.ZONES)
+        obs_dim = n_z  # zone temps
+        obs_dim += 1   # outside air temp
+        obs_dim += 2   # sin_tod, cos_tod (always included)
+        if self.include_trend_60m:
+            obs_dim += 2
+        if self.include_trend_15m:
+            obs_dim += 2
+        if self.include_doy_features:
+            obs_dim += 2
+        if self.include_occ_flag:
+            obs_dim += 1
+        self.obs_dim = int(obs_dim)
+        self.act_dim = int(n_z)
+
         # IMPORTANT: For get_meter_handle(), pass just the meter name (no ",hourly").
         self.energy_meter_name = energy_meter_name.split(",")[0].strip()
-
         self.dump_api_available_csv = dump_api_available_csv
         self.debug_meter_every_n_steps = debug_meter_every_n_steps
-
-        self.reward_mode = (reward_mode or "delta").lower()
         self.reward_scale = float(reward_scale) if reward_scale else 1.0
 
         # ---- Action mapping config ----
@@ -102,28 +145,59 @@ class RLController:
         self.min_heat_sp = float(min_heat_sp)
         self.max_cool_sp = float(max_cool_sp)
         self.min_deadband = float(min_deadband)
+
+        self.policy_kind = (policy_kind or "simple").lower()
+        self._is_torch_policy = self.policy_kind == "torch"
+
+        print(f"Energy Meter used for reward fuction: {self.energy_meter_name}")
+
         # Worker-side policy (loads once at init, no per-timestep RPC)
-        # Default path matches the orchestrator contract: /shared/policy/latest/policy.pt
-        if (policy_kind or "").lower() == "torch":
+        if self._is_torch_policy:
+            print("TorchPolicyModel..... loaded")
             self.rl_model = TorchPolicyModel(policy_path)
         else:
-            self.rl_model = SimpleRLModel()
-        
-        self.trajectory = {"states": [], "actions": [], "rewards": []}
-        # TD3-style replay writer (obs, act, rew, next_obs, done)
-        self.rollout_writer = RolloutWriter(self.rollout_dir, self.rollout_id, obs_dim=2, act_dim=1)
-        # Handle readiness / sentinels to avoid AttributeError spam
+            print("SimpleRLModel..... loaded")
+            self.rl_model = SimpleRLModel(num_zones=len(self.ZONES))
+
+        # TD3-style replay writer
+        self.rollout_writer = RolloutWriter(
+            self.rollout_dir, 
+            self.rollout_id, 
+            obs_dim=self.obs_dim, 
+            act_dim=self.act_dim,
+            zones=self.ZONES,
+            start_mmdd=os.getenv("EPLUS_START_MMDD"),
+            end_mmdd=os.getenv("EPLUS_END_MMDD"),
+            reward_mode=os.getenv("ANDRUIX_REWARD_MODE"),
+            reward_scale=float(os.getenv("ANDRUIX_REWARD_SCALE", "0") or 0) or None,
+            obs_flags={
+                "include_occ": bool(int(os.getenv("ANDRUIX_OBS_OCC", "0"))),
+                "no_doy": bool(int(os.getenv("ANDRUIX_OBS_NO_DOY", "0"))),
+                "no_trend_15m": bool(int(os.getenv("ANDRUIX_OBS_NO_TREND_15M", "0"))),
+                "no_trend_60m": bool(int(os.getenv("ANDRUIX_OBS_NO_TREND_60M", "0"))),
+            },
+        )
+
+        # Per-worker debug timeseries writer (parquet/csv) keyed by rollout_id
+        self.ts_writer = WorkerTimeseriesWriter(
+            out_dir=self.outdir,          # writes to /shared/results/<rollout_id>/ (your --outdir)
+            rollout_id=self.rollout_id,
+            zones=self.ZONES,
+            policy_fingerprint=os.getenv("ANDRUIX_POLICY_SHA") or None,
+            image_tag=os.getenv("ANDRUIX_IMAGE_TAG") or None,
+        )
+        self._ts_pending = None  # begin-callback stash; flushed in end-callback
+
+        # Handle readiness / sentinels
         self.handles_ready = False
         self.api_dumped = False
-
-        self.room_temp_handle = -1
-        self.outside_temp_handle = -1
         self.facility_elec_meter_handle = -1
-        self.heat_sp_handle = -1
-        self.cool_sp_handle = -1
-
-        self.last_meter_val = None
+        self.heat_sp_handles = {}
+        self.cool_sp_handles = {}
+        self.room_temp_handles = {}         # zone_name → handle
+        self.outside_temp_handle = None      # shared
         self.step_count = 0
+        self.dbg_count = 0
         self.init_attempts = 0
 
         self._prev_obs = None
@@ -134,100 +208,71 @@ class RLController:
         self._prev_minute_of_day = None
 
         # Last applied setpoints (for comfort + slew penalty)
-        self._last_heat_sp = None
-        self._last_cool_sp = None
-        self._last_center_sp = None
-        self._last_occupied = None
+        self._last_heat_sp = {zone: None for zone in self.ZONES}
+        self._last_cool_sp = {zone: None for zone in self.ZONES}
+        self._prev_center_sp = {zone: None for zone in self.ZONES}
+        self._last_center_sp = {zone: None for zone in self.ZONES}
 
-
-        # Metrics
-        self._cum_occ_comfort_violation_degmin = 0.0
-        self._cum_hard_violation_degmin = 0.0
-
-        self._last_heat_sp = None
-        self._last_cool_sp = None
-        self._last_center_sp = None
-
-        # Request variables you plan to read
-        for var, key in [
-            ("Zone Mean Air Temperature", self.ZONE),
+        # List of (variable_name, key) pairs we want
+        variables_to_request = [
             ("Site Outdoor Air Drybulb Temperature", "Environment"),
-        ]:
-            self.api.exchange.request_variable(state, var, key)
+        ]
+
+        # Add one entry per zone for zone mean air temperature
+        for zone_name in self.ZONES:
+            variables_to_request.append(("Zone Mean Air Temperature", zone_name))
+
+        # Now request them all
+        for var_name, key in variables_to_request:
+            self.api.exchange.request_variable(state, var_name, key)
 
         # Callbacks
-        self.api.runtime.callback_after_new_environment_warmup_complete(
-            state, self._try_init_handles
-        )
-
-        self.api.runtime.callback_begin_zone_timestep_before_init_heat_balance(
-            state, self.begin_timestep_callback
-        )
-
-        self.api.runtime.callback_end_system_timestep_after_hvac_reporting(
-            state, self.end_system_timestep_callback
-        )
-
+        self.api.runtime.callback_after_new_environment_warmup_complete(state, self._try_init_handles)
+        self.api.runtime.callback_begin_zone_timestep_before_init_heat_balance(state, self.begin_timestep_callback)
+        self.api.runtime.callback_end_system_timestep_after_hvac_reporting(state, self.end_system_timestep_callback)
 
     # ---- init / readiness ----
     def _try_init_handles(self, state):
-        """Safe init attempt: no raising inside ctypes callback. Retries until ready."""
         if self.handles_ready:
             return
-
         if not self.api.exchange.api_data_fully_ready(state):
             return
-        
         if self.api.exchange.warmup_flag(state):
             return
 
-
-        # Dump available API data once (helps confirm exact meter spelling)
         if self.dump_api_available_csv and not self.api_dumped:
             try:
-                csv_bytes = self.api.exchange.list_available_api_data_csv(state)  # returns bytes
-                (self.outdir / "api_available.csv").write_bytes(csv_bytes)
+                csv_bytes = self.api.exchange.list_available_api_data_csv(state)
+                (self.outdir / 'api_available.csv').write_bytes(csv_bytes)
                 self.api_dumped = True
                 print(f"[init] Wrote {self.outdir / 'api_available.csv'}")
-
-                # Quick sanity: print a few meter rows so we can see exact names/keys
-                text = csv_bytes.decode("utf-8", errors="replace")
-                meter_lines = [ln for ln in text.splitlines() if ln.startswith("Meter,")]
-                print("[init] First meters exposed by API:")
-                for ln in meter_lines[:25]:
-                    print("   ", ln)
-
             except Exception as e:
                 print(f"[init] WARNING: failed to write api_available.csv: {e}")
-                self.api_dumped = True  # prevent endless retry spam if desired
+                self.api_dumped = True
 
+        # Shared handles
+        self.outside_temp_handle = self.api.exchange.get_variable_handle(state, 'Site Outdoor Air Drybulb Temperature', 'Environment')
+        self.facility_elec_meter_handle = self.api.exchange.get_meter_handle(state, self.energy_meter_name)
 
-        # Resolve handles
-        self.room_temp_handle = self.api.exchange.get_variable_handle(
-            state, "Zone Mean Air Temperature", self.ZONE
-        )
-        self.outside_temp_handle = self.api.exchange.get_variable_handle(
-            state, "Site Outdoor Air Drybulb Temperature", "Environment"
-        )
+        # Per-zone handles
+        for zone in self.ZONES:
+            self.heat_sp_handles[zone] = self.api.exchange.get_actuator_handle(state, 'Zone Temperature Control', 'Heating Setpoint', zone)
+            self.cool_sp_handles[zone] = self.api.exchange.get_actuator_handle(state, 'Zone Temperature Control', 'Cooling Setpoint', zone)
+            self.room_temp_handles[zone] = self.api.exchange.get_variable_handle(state, 'Zone Mean Air Temperature', zone)
 
-        self.facility_elec_meter_handle = self.api.exchange.get_meter_handle(
-            state, self.energy_meter_name
-        )
-
-        self.heat_sp_handle = self.api.exchange.get_actuator_handle(
-            state, "Zone Temperature Control", "Heating Setpoint", self.ZONE
-        )
-        self.cool_sp_handle = self.api.exchange.get_actuator_handle(
-            state, "Zone Temperature Control", "Cooling Setpoint", self.ZONE
-        )
-
-        missing = [name for name, h in {
-            "room_temp_handle": self.room_temp_handle,
-            "outside_temp_handle": self.outside_temp_handle,
-            f"meter({self.energy_meter_name})": self.facility_elec_meter_handle,
-            "heat_sp_handle": self.heat_sp_handle,
-            "cool_sp_handle": self.cool_sp_handle,
-        }.items() if h == -1]
+        # Validate
+        missing: list[str] = []
+        if self.outside_temp_handle == -1:
+            missing.append('outside_temp_handle')
+        if self.facility_elec_meter_handle == -1:
+            missing.append(f"meter({self.energy_meter_name})")
+        for z in self.ZONES:
+            if self.room_temp_handles.get(z, -1) == -1:
+                missing.append(f"room_temp_handle[{z}]")
+            if self.heat_sp_handles.get(z, -1) == -1:
+                missing.append(f"heat_sp_handle[{z}]")
+            if self.cool_sp_handles.get(z, -1) == -1:
+                missing.append(f"cool_sp_handle[{z}]")
 
         self.init_attempts += 1
         if missing:
@@ -236,8 +281,8 @@ class RLController:
             return
 
         self.handles_ready = True
-        self.last_meter_val = None
-        print(f"[init] Handles resolved ✔ meter='{self.energy_meter_name}'")
+        self._hist.clear()
+        print(f"[init] Handles resolved ✔ meter='{self.energy_meter_name}' obs_dim={self.obs_dim} act_dim={self.act_dim}")
 
     def _ensure_ready(self, state) -> bool:
         if not self.api.exchange.api_data_fully_ready(state):
@@ -246,9 +291,9 @@ class RLController:
             self._try_init_handles(state)
             return False
         return True
-    
+
     def _get_time_index(self, state):
-        """Return (day_of_year, minute_of_day) from EnergyPlus simulation clock."""
+        """Return (day_of_year, minute_of_day, abs_minute) from EnergyPlus simulation clock."""
         try:
             doy = int(self.api.exchange.day_of_year(state))
             hr = int(self.api.exchange.hour(state))
@@ -256,19 +301,13 @@ class RLController:
             if hr >= 24:
                 hr = 23
                 mn = 59
-
-            mod = max(0, min(1439, hr*60 + mn))
-
-            return doy, mod
+            mod = max(0, min(1439, hr * 60 + mn))
+            abs_minute = (max(1, doy) - 1) * 1440 + mod
+            return doy, mod, abs_minute
         except Exception:
-            return None, None
+            return None, None, None
 
     def _is_occupied(self, minute_of_day: int | None) -> bool:
-        """Simple occupancy heuristic for reward shaping + bounds.
-
-        We keep this intentionally simple for v1 (no schedule handle parsing):
-        occupied if minute_of_day is within [occupied_start_minute, occupied_end_minute).
-        """
         if minute_of_day is None:
             return True
         start = int(self.occupied_start_minute)
@@ -278,22 +317,172 @@ class RLController:
             return True
         if start < end:
             return start <= m < end
-        # Handle wrap-around (e.g. 22:00 -> 06:00)
         return m >= start or m < end
 
-    def _coerce_action(self, act) -> float:
-        """Coerce various action shapes to a scalar float and clip to [-1, 1]."""
+    # ---- trend features ----
+    def _push_history(self, abs_minute, avg_zone_temp, outside_temp):
+        if abs_minute is None:
+            return
         try:
-            a = float(np.asarray(act, dtype=np.float32).reshape(-1)[0])
+            tz = float(avg_zone_temp)
+            toa = float(outside_temp)
         except Exception:
-            a = 0.0
-        # Worker expects normalized action; enforce a hard clip for safety.
-        if not np.isfinite(a):
-            a = 0.0
-        return float(np.clip(a, -1.0, 1.0))
+            return
+        if not (np.isfinite(tz) and np.isfinite(toa)):
+            return
+        self._hist.append((int(abs_minute), tz, toa))
+
+    def _lookup_at_or_before(self, target_abs_minute: int):
+        for t, tz, toa in reversed(self._hist):
+            if t <= target_abs_minute and np.isfinite(tz) and np.isfinite(toa):
+                return float(tz), float(toa)
+        return None
+
+    def _trend_deltas(self, abs_minute: int | None, room_temp: float, outside_temp: float) -> list[float]:
+        feats: list[float] = []
+
+        # Not enough info yet
+        if abs_minute is None or not self._hist:
+            if self.include_trend_60m:
+                feats += [0.0, 0.0]
+            if self.include_trend_15m:
+                feats += [0.0, 0.0]
+            return feats
+
+        cur_tz = float(room_temp)
+        cur_toa = float(outside_temp)
+
+        # If current values are bad, don't emit NaNs
+        if not (np.isfinite(cur_tz) and np.isfinite(cur_toa)):
+            if self.include_trend_60m:
+                feats += [0.0, 0.0]
+            if self.include_trend_15m:
+                feats += [0.0, 0.0]
+            return feats
+
+        if self.include_trend_60m:
+            past = self._lookup_at_or_before(int(abs_minute) - 60)
+            if past is None:
+                feats += [0.0, 0.0]
+            else:
+                p_tz, p_toa = past
+                if not (np.isfinite(p_tz) and np.isfinite(p_toa)):
+                    feats += [0.0, 0.0]
+                else:
+                    feats += [cur_tz - p_tz, cur_toa - p_toa]
+
+        if self.include_trend_15m:
+            past = self._lookup_at_or_before(int(abs_minute) - 15)
+            if past is None:
+                feats += [0.0, 0.0]
+            else:
+                p_tz, p_toa = past
+                if not (np.isfinite(p_tz) and np.isfinite(p_toa)):
+                    feats += [0.0, 0.0]
+                else:
+                    feats += [cur_tz - p_tz, cur_toa - p_toa]
+
+        return feats
+
+
+    def _make_obs_multi_zone(self, zone_temps_dict, outside_temp, doy, mod, abs_minute):
+        """Observation layout (Path A):
+        [Tz_1..Tz_N] + [Toa] + [sin_tod, cos_tod] +
+        [dTzAvg_60, dToa_60] + [dTzAvg_15, dToa_15] +
+        [sin_doy, cos_doy] + [occ_flag]
+        """
+        obs_parts: list[float] = []
+
+        # 1) Zone temps in the provided zone order
+        tz_list: list[float] = []
+        for z in self.ZONES:
+            v = zone_temps_dict.get(z, None)
+            if v is None:
+                tz_list.append(float('nan'))
+                print(f"[make_obs_bad] step={self.step_count} | zone={z} | missing value → NaN")
+                continue
+
+            try:
+                tz = float(v)
+                if not np.isfinite(tz):
+                    raise ValueError(f"non-finite value: {tz}")
+                tz_list.append(tz)
+            except (ValueError, TypeError) as e:
+                tz_list.append(float('nan'))
+                print(f"[make_obs_bad] step={self.step_count} | zone={z} | value={v!r} → NaN | error={str(e)}")
+
+        obs_parts.extend(tz_list)
+
+        # 2) Outside air temp
+        try:
+            toa = float(outside_temp)
+            if not np.isfinite(toa):
+                raise ValueError("non-finite Toa")
+        except (ValueError, TypeError) as e:
+            print(f"[make_obs_bad] Toa conversion failed  value={outside_temp!r}  error={str(e)}")
+            toa = float('nan')
+        obs_parts.append(toa)
+
+        # 3) Time-of-day sin/cos (always included)
+        if mod is None:
+            sin_tod, cos_tod = 0.0, 0.0
+        else:
+            tod = float(mod) / 1440.0
+            sin_tod = float(np.sin(2.0 * np.pi * tod))
+            cos_tod = float(np.cos(2.0 * np.pi * tod))
+        obs_parts.extend([sin_tod, cos_tod])
+
+        # 4) Shared trend deltas using avg zone temp + outside temp
+        if len(tz_list) > 0:
+            tz_avg = float(np.nanmean(tz_list))
+        else:
+            tz_avg = float('nan')
+            print(f"[make_obs_bad] tz_list was empty → returning NaN")
+
+        obs_parts.extend(self._trend_deltas(abs_minute, tz_avg, toa))
+
+        # 5) Day-of-year sin/cos (optional)
+        if self.include_doy_features:
+            if doy is None:
+                obs_parts.extend([0.0, 0.0])
+            else:
+                frac = float(doy) / 365.0
+                obs_parts.extend([float(np.sin(2.0 * np.pi * frac)), float(np.cos(2.0 * np.pi * frac))])
+
+        # 6) Occupancy flag (optional)
+        occupied = self._is_occupied(mod)
+        if self.include_occ_flag:
+            obs_parts.append(1.0 if occupied else 0.0)
+
+        return np.asarray(obs_parts, dtype=np.float32), occupied
+
+    def _coerce_action_vec(self, act, n: int) -> np.ndarray:
+        """Minimal contract enforcement for actions.
+        - ensures shape (n,)
+        - replaces NaN/Inf with 0
+        - clips to [-1, 1] because _map_action_to_setpoints expects normalized actions
+        """
+        try:
+            a = np.asarray(act, dtype=np.float32).reshape(-1)
+        except Exception:
+            a = np.zeros((n,), dtype=np.float32)
+
+        if a.size == 1 and n > 1:
+            a = np.full((n,), float(a[0]), dtype=np.float32)
+        elif a.size < n:
+            pad = np.zeros((n - a.size,), dtype=np.float32)
+            a = np.concatenate([a, pad], axis=0)
+        elif a.size > n:
+            a = a[:n]
+
+        a = np.where(np.isfinite(a), a, 0.0).astype(np.float32)
+        return np.clip(a, -1.0, 1.0).astype(np.float32)
+
+    def _coerce_action(self, act) -> float:
+        """Back-compat scalar coercion."""
+        return float(self._coerce_action_vec(act, 1)[0])
 
     def _map_action_to_setpoints(self, a: float, occupied: bool) -> tuple[float, float, float]:
-        """Map normalized action a\in[-1,1] -> (heat_sp, cool_sp, center_sp) in °C."""
         if occupied:
             cmin, cmax = self.sp_center_min_occ, self.sp_center_max_occ
             deadband = self.deadband_occ
@@ -301,23 +490,17 @@ class RLController:
             cmin, cmax = self.sp_center_min_unocc, self.sp_center_max_unocc
             deadband = self.deadband_unocc
 
-        # Map [-1,1] -> [cmin,cmax]
         center = float(cmin + 0.5 * (a + 1.0) * (cmax - cmin))
-
-        # Derive setpoints via deadband around the centerline
         heat = center - 0.5 * float(deadband)
         cool = center + 0.5 * float(deadband)
 
-        # Safety clamps
         heat = max(heat, self.min_heat_sp)
         cool = min(cool, self.max_cool_sp)
 
-        # Enforce minimum deadband
         if (cool - heat) < self.min_deadband:
             mid = 0.5 * (heat + cool)
             heat = mid - 0.5 * self.min_deadband
             cool = mid + 0.5 * self.min_deadband
-            # Re-clamp while preserving the minimum deadband as best we can
             if heat < self.min_heat_sp:
                 heat = self.min_heat_sp
                 cool = heat + self.min_deadband
@@ -327,8 +510,8 @@ class RLController:
 
         center = 0.5 * (heat + cool)
         return float(heat), float(cool), float(center)
+
     def _temp_violation(self, temp_c: float, low: float, high: float) -> float:
-        """Return degrees-C violation outside [low, high] (0 if inside)."""
         below = max(0.0, float(low) - float(temp_c))
         above = max(0.0, float(temp_c) - float(high))
         return below + above
@@ -338,21 +521,38 @@ class RLController:
         if not self._ensure_ready(state):
             return
 
-        room_temp = self.api.exchange.get_variable_value(state, self.room_temp_handle)
+        # 1) Current zone temps (controlled zones)
+        zone_temps: dict[str, float] = {}
+        for zone in self.ZONES:
+            h = self.room_temp_handles.get(zone, -1)
+            if h == -1:
+                zone_temps[zone] = float('nan')
+                continue
+            v = self.api.exchange.get_variable_value(state, h)
+            zone_temps[zone] = float(v) if v is not None else float('nan')
+
+        # 2) Outside air temp
         outside_temp = self.api.exchange.get_variable_value(state, self.outside_temp_handle)
-        obs = np.array([room_temp, outside_temp], dtype=np.float32)
+        outside_temp = float(outside_temp) if outside_temp is not None else float('nan')
 
-        doy, mod = self._get_time_index(state)
+        # 3) Time
+        doy, mod, abs_minute = self._get_time_index(state)
 
-        occupied = self._is_occupied(mod)
+        # 4) Update shared history for trend features
+        avg_zone_temp = float(np.nanmean(list(zone_temps.values()))) if zone_temps else float('nan')
+        self._push_history(abs_minute, avg_zone_temp, outside_temp)
 
+        # 5) Build observation
+        obs, occupied = self._make_obs_multi_zone(zone_temps, outside_temp, doy, mod, abs_minute)
 
+        if self.step_count % 10 == 0:
+            print(f"[obs_debug] any_nonfinite={np.any(~np.isfinite(obs))}")
 
-        # If we have reward from the previous system timestep, we can now finalize last transition:
+        # 6) Finalize previous transition (reward computed in end_system_timestep_callback)
         if self._prev_obs is not None and self._prev_act is not None and self._pending_rew is not None:
             self.rollout_writer.append(
                 obs=self._prev_obs,
-                act=np.asarray([self._prev_act], dtype=np.float32),
+                act=np.asarray(self._prev_act, dtype=np.float32),
                 rew=float(self._pending_rew),
                 next_obs=obs,
                 done=0.0,
@@ -362,109 +562,205 @@ class RLController:
             )
             self._pending_rew = None
             self._pending_energy = None
-        self._pending_energy = None
-        self._prev_day_of_year = None
-        self._prev_minute_of_day = None
 
-        # --- Policy action (normalized) ---
-        act_raw = self.rl_model.get_action(obs)
-        act = self._coerce_action(act_raw)
+        # 7) Policy action (normalized per zone)
+        a_raw = self.rl_model.get_action(obs)
+        explore_noise = float(os.environ.get('ANDRUIX_EXPLORE_NOISE', '0.0'))
+        if explore_noise > 0.0:
+            a_raw = np.asarray(a_raw, dtype=np.float32).reshape(-1) + np.random.normal(0.0, explore_noise, size=len(self.ZONES)).astype(np.float32)
+        
+        a_norm = self._coerce_action_vec(a_raw, n=len(self.ZONES))
 
-        # Map to thermostat setpoints
-        heat_sp, cool_sp, center_sp = self._map_action_to_setpoints(act, occupied)
+        ar = np.asarray(a_raw)
+        an = np.asarray(a_norm)
 
-        # Apply to heating and cooling setpoints
-        self.api.exchange.set_actuator_value(state, self.heat_sp_handle, heat_sp)
-        self.api.exchange.set_actuator_value(state, self.cool_sp_handle, cool_sp)
+        print(
+            "[a_dbg]"
+            f" a_raw(type={type(a_raw).__name__}, shape={ar.shape}, dtype={ar.dtype if hasattr(ar,'dtype') else 'n/a'})"
+            f" min={np.nanmin(ar):.4f} max={np.nanmax(ar):.4f} mean={np.nanmean(ar):.4f}"
+            f" any_nonfinite={np.any(~np.isfinite(ar))}"
+            f" sample={ar.reshape(-1)[:min(5, ar.size)]}"
+            " |"
+            f" a_norm(shape={an.shape}, dtype={an.dtype})"
+            f" min={np.nanmin(an):.4f} max={np.nanmax(an):.4f} mean={np.nanmean(an):.4f}"
+            f" any_nonfinite={np.any(~np.isfinite(an))}"
+            f" sample={an.reshape(-1)[:min(5, an.size)]}"
+        )
 
-        self._last_heat_sp = heat_sp
-        self._last_cool_sp = cool_sp
-        self._last_center_sp = center_sp
-        self._last_occupied = occupied
-        self._last_occupied = occupied
+        # Prepare dicts for timeseries logging
+        zone_actions_norm = {z: float(a_norm[i]) for i, z in enumerate(self.ZONES)}
+        zone_heat_sp = {}
+        zone_cool_sp = {}
 
+        # 8) Apply setpoints per zone
+        for i, zone in enumerate(self.ZONES):
+            heat_sp, cool_sp, center_sp = self._map_action_to_setpoints(float(a_norm[i]), occupied)
+
+            # Save for timeseries
+            zone_heat_sp[zone] = float(heat_sp)
+            zone_cool_sp[zone] = float(cool_sp)
+
+            self.api.exchange.set_actuator_value(state, self.heat_sp_handles[zone], heat_sp)
+            self.api.exchange.set_actuator_value(state, self.cool_sp_handles[zone], cool_sp)
+
+            # Track for slew penalty
+            self._last_heat_sp[zone] = heat_sp
+            self._last_cool_sp[zone] = cool_sp
+            if self._last_center_sp[zone] is not None:
+                self._prev_center_sp[zone] = self._last_center_sp[zone]
+            self._last_center_sp[zone] = center_sp
+
+        # 9) Save state for next transition
         self._prev_obs = obs
-        self._prev_act = act
+        self._prev_act = a_norm
         self._prev_day_of_year = doy
         self._prev_minute_of_day = mod
 
-    
+        # Timeseries: stash begin-step info, flush in end_system_timestep_callback
+        self._ts_pending = {
+            "step_idx": int(self.step_count),          # aligns with reward/energy computed at end of this timestep
+            "day_of_year": doy,
+            "minute_of_day": mod,
+            "outside_air_c": float(outside_temp),
+            "zone_temps_c": {k: float(v) for k, v in zone_temps.items()},
+            "zone_setpoints_heat_c": zone_heat_sp,
+            "zone_setpoints_cool_c": zone_cool_sp,
+            "zone_actions_norm": zone_actions_norm,
+            "occupied": 1.0 if occupied else 0.0,      # optional scalar
+        }
+
     def end_system_timestep_callback(self, state):
         if not self._ensure_ready(state):
             return
 
-        raw_val = self.api.exchange.get_meter_value(state, self.facility_elec_meter_handle)
+        # 1. Get current zone temperatures (dict: zone → temp)
+        zone_temps = {}
+        for zone in self.ZONES:
+            handle = self.room_temp_handles.get(zone, -1)
+            if handle == -1:
+                continue
+            temp = self.api.exchange.get_variable_value(state, handle)
+            zone_temps[zone] = temp if temp is not None else np.nan
 
-        # Disambiguate a 0.0 return (could be valid or could be invalid handle)
+        # 2. Confirm setpoints per zone (for debug)
+        confirmed_setpoints = {}
+        for zone in self.ZONES:
+            h_handle = self.heat_sp_handles.get(zone, -1)
+            c_handle = self.cool_sp_handles.get(zone, -1)
+            if h_handle != -1 and c_handle != -1:
+                confirmed_heat = self.api.exchange.get_actuator_value(state, h_handle)
+                confirmed_cool = self.api.exchange.get_actuator_value(state, c_handle)
+                confirmed_setpoints[zone] = (confirmed_heat, confirmed_cool)
+
+        # Optional: log confirmed setpoints (every 10 steps)
+        if self.step_count % 10 == 0:
+            for zone, (h, c) in confirmed_setpoints.items():
+                print(f"[verify_end] Zone {zone}: heat_confirmed={h:.2f}, cool_confirmed={c:.2f}")
+
+        # 3. Outside temp (shared)
+        outside_temp = self.api.exchange.get_variable_value(state, self.outside_temp_handle)
+
+        # 4. Meter reading (shared — facility or HVAC)
+        raw_val = self.api.exchange.get_meter_value(state, self.facility_elec_meter_handle)
         if raw_val == 0.0 and self.api.exchange.api_error_flag(state):
             print("[meter] api_error_flag=True reading meter; handle likely invalid")
             return
 
-        # Meter interpretation:
-        # - Many EnergyPlus meters are cumulative over the run. In that case, delta is what you want per step.
-        # - If your chosen meter is already per-timestep, 'raw' may be fine.
-        delta = None
-        if self.last_meter_val is None:
-            delta = 0.0
-        else:
-            delta = float(raw_val) - float(self.last_meter_val)
-            # If meter ever resets/backtracks, clamp to 0 for safety
-            if delta < 0.0:
-                delta = 0.0
-        self.last_meter_val = float(raw_val)
-
-        use_val = float(raw_val) if self.reward_mode == "raw" else float(delta)
+        # Raw timestep meter value (J) -> kWh (if reward_scale=3.6e6)
+        use_val = float(raw_val)
         scale = self.reward_scale if self.reward_scale != 0.0 else 1.0
         energy_kwh = use_val / scale
 
-        # --- Comfort + constraint penalties ---
-        # Measure zone temperature at the end of the system timestep.
-        temp_now = self.api.exchange.get_variable_value(state, self.room_temp_handle)
-        occupied = self._is_occupied(self._prev_minute_of_day)
-
+        # 5. Comfort & hard penalties — per-zone, then average
         comfort_pen = 0.0
-        if occupied and self.comfort_weight > 0.0:
-            v = self._temp_violation(temp_now, self.comfort_low, self.comfort_high)
-            comfort_pen = self.comfort_weight * (v * v)
-
         hard_pen = 0.0
-        if self.hard_weight > 0.0:
-            v = self._temp_violation(temp_now, self.hard_low, self.hard_high)
-            hard_pen = self.hard_weight * (v * v)
+        num_valid_zones = 0
 
+        occupied = self._is_occupied(self._prev_minute_of_day)  # assuming shared occupancy
+
+        if occupied and (self.comfort_weight > 0.0 or self.hard_weight > 0.0):
+            for zone, temp_now in zone_temps.items():
+                if np.isnan(temp_now):
+                    continue
+                num_valid_zones += 1
+
+                # Comfort penalty (squared violation)
+                if self.comfort_weight > 0.0:
+                    v = self._temp_violation(temp_now, self.comfort_low, self.comfort_high)
+                    comfort_pen += self.comfort_weight * (v * v)
+
+                # Hard penalty
+                if self.hard_weight > 0.0:
+                    v = self._temp_violation(temp_now, self.hard_low, self.hard_high)
+                    hard_pen += self.hard_weight * (v * v)
+
+            # Average (normalize by num zones to keep scale consistent)
+            if num_valid_zones > 0:
+                comfort_pen /= num_valid_zones
+                hard_pen /= num_valid_zones
+
+        # 6. Slew penalty — per-zone, then average
         slew_pen = 0.0
-        if self.slew_weight > 0.0 and self._last_center_sp is not None:
-            # Penalize large setpoint changes (reduces bang-bang behavior)
-            if getattr(self, "_prev_center_sp", None) is not None:
-                d = float(self._last_center_sp) - float(self._prev_center_sp)
-                slew_pen = self.slew_weight * (d * d)
-            self._prev_center_sp = float(self._last_center_sp)
+        if self.slew_weight > 0.0:
+            slew_sum = 0.0
+            for zone in self.ZONES:
+                prev = self._prev_center_sp.get(zone)
+                last = self._last_center_sp.get(zone)
+                if prev is not None and last is not None:
+                    d = float(last) - float(prev)
+                    slew_sum += self.slew_weight * (d * d)
+            # Average
+            slew_pen = slew_sum / max(1, len(self.ZONES))
 
+        # 7. Total reward
         rew = -energy_kwh - comfort_pen - hard_pen - slew_pen
 
-        # Optional debug print (helps validate penalties + action mapping)
+        # 8. Step count & debug print (updated for multi-zone summary)
         self.step_count += 1
         if self.debug_meter_every_n_steps and (self.step_count % self.debug_meter_every_n_steps == 0):
-            meter_str = f"raw={raw_val:.2f}" if self.reward_mode == "raw" else f"delta={delta:.2f}"
+            meter_str = f"raw={raw_val:.2f}"
+            avg_tz = np.nanmean(list(zone_temps.values())) if zone_temps else np.nan
             print(
                 f"[step {self.step_count}] {meter_str} kWh={energy_kwh:.4f} "
-                f"Tz={temp_now:.2f}C occ={occupied} "
-                f"Hsp={self._last_heat_sp:.1f} Csp={self._last_cool_sp:.1f} "
+                f"avg_Tz={avg_tz:.2f}C occ={occupied} "
                 f"pen(c={comfort_pen:.3f}, h={hard_pen:.3f}, s={slew_pen:.3f}) rew={rew:.4f}"
             )
 
+        # 9. Store for rollout
         self._pending_rew = rew
         self._pending_energy = energy_kwh
 
+                # Timeseries: flush the pending row now that energy + reward are known
+        if self._ts_pending is not None:
+            p = self._ts_pending
+            self.ts_writer.append_step(
+                step_idx=p["step_idx"],
+                day_of_year=p["day_of_year"],
+                minute_of_day=p["minute_of_day"],
+                outside_air_c=p["outside_air_c"],
+                hvac_energy_kwh=float(energy_kwh),
+                reward=float(rew),
+                zone_temps_c=p["zone_temps_c"],
+                zone_setpoints_heat_c=p["zone_setpoints_heat_c"],
+                zone_setpoints_cool_c=p["zone_setpoints_cool_c"],
+                zone_actions_norm=p["zone_actions_norm"],
+                extra_scalars={
+                    "occupied": float(p.get("occupied", 1.0)),
+                    # easy future adds:
+                    # "comfort_pen": float(comfort_pen),
+                    # "hard_pen": float(hard_pen),
+                    # "slew_pen": float(slew_pen),
+                },
+            )
+            self._ts_pending = None
 
     def finalize_and_write_rollout(self):
-        # If sim ended and we still have a pending reward, close out with a terminal transition
         if self._prev_obs is not None and self._prev_act is not None and self._pending_rew is not None:
             self.rollout_writer.append(
                 obs=self._prev_obs,
-                act=np.asarray([self._prev_act], dtype=np.float32),
+                act=np.asarray(self._prev_act, dtype=np.float32),
                 rew=float(self._pending_rew),
-                next_obs=self._prev_obs,  # terminal
+                next_obs=self._prev_obs,
                 done=1.0,
                 day_of_year=self._prev_day_of_year,
                 minute_of_day=self._prev_minute_of_day,
@@ -472,207 +768,66 @@ class RLController:
             )
             self._pending_rew = None
             self._pending_energy = None
-        self._pending_energy = None
-        self._prev_day_of_year = None
-        self._prev_minute_of_day = None
 
         out_npz = self.rollout_writer.write()
         print(f"[rollout] wrote {out_npz}")
 
+        ts_path = self.ts_writer.write()
+        print(f"[timeseries] wrote {ts_path}")
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="EnergyPlus + PyEnergyPlus callback runner")
-    p.add_argument(
-        "--idf",
-        default=os.environ.get("EPLUS_IDF", "/home/guser/models/IECC_OfficeMedium_STD2021_Denver_RL_BASELINE_1_0.idf"),
-    )
-    p.add_argument(
-        "--epw",
-        default=os.environ.get("EPLUS_EPW", "/home/guser/weather/5B_USA_CO_BOULDER.epw"),
-    )
-    p.add_argument(
-        "--outdir",
-        default=os.environ.get("EPLUS_OUTDIR", "/home/guser/results/"),
-    )
-    p.add_argument(
-        "--zone",
-        default=os.environ.get("EPLUS_ZONE", "PERIMETER_BOT_ZN_3"),
-    )
-    p.add_argument(
-        "--energy-meter",
-        default=os.environ.get("EPLUS_METER", "Electricity:Building"),
-        help="Meter name for get_meter_handle(). Do NOT include reporting frequency (e.g., no ',hourly').",
-    )
-    p.add_argument(
-        "--dump-api-csv",
-        action="store_true",
-        default=os.environ.get("EPLUS_DUMP_API_CSV", "1") == "1",
-    )
-    p.add_argument(
-        "--rollout-dir", 
-        default=os.environ.get("ROLLOUT_DIR", "/home/guser/rollouts")
-    )
-    p.add_argument(
-        "--rollout-id", 
-        default=os.environ.get("ROLLOUT_ID", 
-        str(uuid.uuid4()))
-    )
+    p = argparse.ArgumentParser(description="EnergyPlus + PyEnergyPlus callback runner (Step 1.2: time + trend features)")
+    p.add_argument("--idf", default=os.environ.get("EPLUS_IDF", "/home/guser/models/IECC_OfficeMedium_STD2021_Denver_RL_HIGH_ENERGY.idf"))
+    p.add_argument("--epw", default=os.environ.get("EPLUS_EPW", "/home/guser/weather/5B_USA_CO_BOULDER.epw"))
+    p.add_argument("--outdir", default=os.environ.get("EPLUS_OUTDIR", "/home/guser/results/"))
+    p.add_argument("--zones", default=os.environ.get("EPLUS_ZONE", "PERIMETER_BOT_ZN_3"))
+    p.add_argument("--energy-meter", default=os.environ.get("EPLUS_METER", "Electricity:Building"))
+    p.add_argument("--dump-api-csv", action="store_true", default=os.environ.get("EPLUS_DUMP_API_CSV", "1") == "1")
+    p.add_argument("--rollout-dir", default=os.environ.get("ROLLOUT_DIR", "/home/guser/rollouts"))
+    p.add_argument("--rollout-id", default=os.environ.get("ROLLOUT_ID", str(uuid.uuid4())))
 
-    p.add_argument(
-        "--start-date",
-        default=os.environ.get("EPLUS_START_DATE", ""),
-        help="Optional: start date for windowed run in MM/DD (e.g., 09/01).",
-    )
-    p.add_argument(
-        "--end-date",
-        default=os.environ.get("EPLUS_END_DATE", ""),
-        help="Optional: end date for windowed run in MM/DD (e.g., 09/07).",
-    )
+    p.add_argument("--start-date", default=os.environ.get("EPLUS_START_MMDD", ""))
+    p.add_argument("--end-date", default=os.environ.get("EPLUS_END_MMDD", ""))
 
-    p.add_argument(
-        "--policy-kind",
-        default=os.environ.get("ANDRUIX_POLICY_KIND", "simple"),
-        choices=["simple", "torch"],
-        help="Which policy implementation to use on the worker. Use simple for smoke tests.",
-    )
-    p.add_argument(
-        "--reward-mode",
-        default=os.environ.get("ANDRUIX_REWARD_MODE", "delta"),
-        choices=["raw", "delta"],
-        help="Reward uses raw meter value ('raw') or per-step delta of the meter ('delta'). Delta is recommended if the meter is cumulative.",
-    )
-    p.add_argument(
-        "--reward-scale",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_REWARD_SCALE", "1000000.0")),
-        help="Divide reward by this scale factor to keep magnitudes reasonable (e.g., 1e6 or 1e9).",
-    )
+    p.add_argument("--policy-kind", default=os.environ.get("ANDRUIX_POLICY_KIND", "torch"), choices=["simple", "torch"])
+    p.add_argument("--policy-path", default=os.environ.get("ANDRUIX_POLICY_PATH", os.environ.get("POLICY_PATH", "")))
+    p.add_argument("--reward-scale", type=float, default=float(os.environ.get("ANDRUIX_REWARD_SCALE", "1000000.0")))
 
-    # --- Step 1: action semantics + comfort/constraint penalties ---
-    p.add_argument(
-        "--sp-center-min-occ",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_SP_CENTER_MIN_OCC", "21.0")),
-        help="Occupied min centerline setpoint (°C) for action mapping.",
-    )
-    p.add_argument(
-        "--sp-center-max-occ",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_SP_CENTER_MAX_OCC", "24.0")),
-        help="Occupied max centerline setpoint (°C) for action mapping.",
-    )
-    p.add_argument(
-        "--sp-center-min-unocc",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_SP_CENTER_MIN_UNOCC", "18.0")),
-        help="Unoccupied min centerline setpoint (°C) for action mapping.",
-    )
-    p.add_argument(
-        "--sp-center-max-unocc",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_SP_CENTER_MAX_UNOCC", "28.0")),
-        help="Unoccupied max centerline setpoint (°C) for action mapping.",
-    )
-    p.add_argument(
-        "--deadband-occ",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_DEADBAND_OCC", "1.0")),
-        help="Occupied thermostat deadband width (°C).",
-    )
-    p.add_argument(
-        "--deadband-unocc",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_DEADBAND_UNOCC", "2.0")),
-        help="Unoccupied thermostat deadband width (°C).",
-    )
-    p.add_argument(
-        "--occupied-start-minute",
-        type=int,
-        default=int(os.environ.get("ANDRUIX_OCC_START_MIN", str(8 * 60))),
-        help="Minute-of-day when occupied period starts (default 480 = 08:00).",
-    )
-    p.add_argument(
-        "--occupied-end-minute",
-        type=int,
-        default=int(os.environ.get("ANDRUIX_OCC_END_MIN", str(18 * 60))),
-        help="Minute-of-day when occupied period ends (default 1080 = 18:00).",
-    )
+    # Observation feature toggles
+    p.add_argument("--include-occ-flag", action="store_true", default=os.environ.get("ANDRUIX_OBS_OCC", "1") == "1")
+    p.add_argument("--no-doy-features", action="store_true", default=os.environ.get("ANDRUIX_OBS_NO_DOY", "0") == "1")
+    p.add_argument("--no-trend-60m", action="store_true", default=os.environ.get("ANDRUIX_OBS_NO_TREND_60M", "0") == "1")
+    p.add_argument("--no-trend-15m", action="store_true", default=os.environ.get("ANDRUIX_OBS_NO_TREND_15M", "0") == "1")
 
-    p.add_argument(
-        "--comfort-low",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_COMFORT_LOW", "21.0")),
-        help="Occupied comfort lower bound (°C).",
-    )
-    p.add_argument(
-        "--comfort-high",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_COMFORT_HIGH", "24.0")),
-        help="Occupied comfort upper bound (°C).",
-    )
-    p.add_argument(
-        "--comfort-weight",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_COMFORT_W", "0.1")),
-        help="Penalty weight for occupied comfort violations (kWh-equivalent per °C^2 per timestep).",
-    )
+    # Step 1 controls
+    p.add_argument("--sp-center-min-occ", type=float, default=float(os.environ.get("ANDRUIX_SP_CENTER_MIN_OCC", "21.0")))
+    p.add_argument("--sp-center-max-occ", type=float, default=float(os.environ.get("ANDRUIX_SP_CENTER_MAX_OCC", "24.0")))
+    p.add_argument("--sp-center-min-unocc", type=float, default=float(os.environ.get("ANDRUIX_SP_CENTER_MIN_UNOCC", "18.0")))
+    p.add_argument("--sp-center-max-unocc", type=float, default=float(os.environ.get("ANDRUIX_SP_CENTER_MAX_UNOCC", "28.0")))
+    p.add_argument("--deadband-occ", type=float, default=float(os.environ.get("ANDRUIX_DEADBAND_OCC", "1.0")))
+    p.add_argument("--deadband-unocc", type=float, default=float(os.environ.get("ANDRUIX_DEADBAND_UNOCC", "2.0")))
+    p.add_argument("--occupied-start-minute", type=int, default=int(os.environ.get("ANDRUIX_OCC_START_MIN", str(8 * 60))))
+    p.add_argument("--occupied-end-minute", type=int, default=int(os.environ.get("ANDRUIX_OCC_END_MIN", str(18 * 60))))
 
-    p.add_argument(
-        "--hard-low",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_HARD_LOW", "15.0")),
-        help="Hard lower bound (°C) applied all the time.",
-    )
-    p.add_argument(
-        "--hard-high",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_HARD_HIGH", "30.0")),
-        help="Hard upper bound (°C) applied all the time.",
-    )
-    p.add_argument(
-        "--hard-weight",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_HARD_W", "5.0")),
-        help="Penalty weight for hard constraint violations (kWh-equivalent per °C^2 per timestep).",
-    )
-    p.add_argument(
-        "--slew-weight",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_SLEW_W", "0.0")),
-        help="Penalty weight for setpoint changes (°C^2 per timestep).",
-    )
+    p.add_argument("--comfort-low", type=float, default=float(os.environ.get("ANDRUIX_COMFORT_LOW", "21.0")))
+    p.add_argument("--comfort-high", type=float, default=float(os.environ.get("ANDRUIX_COMFORT_HIGH", "24.0")))
+    p.add_argument("--comfort-weight", type=float, default=float(os.environ.get("ANDRUIX_COMFORT_W", "0.1")))
+    p.add_argument("--hard-low", type=float, default=float(os.environ.get("ANDRUIX_HARD_LOW", "15.0")))
+    p.add_argument("--hard-high", type=float, default=float(os.environ.get("ANDRUIX_HARD_HIGH", "30.0")))
+    p.add_argument("--hard-weight", type=float, default=float(os.environ.get("ANDRUIX_HARD_W", "5.0")))
+    p.add_argument("--slew-weight", type=float, default=float(os.environ.get("ANDRUIX_SLEW_W", "0.0")))
 
-    p.add_argument(
-        "--min-heat-sp",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_MIN_HEAT_SP", "15.0")),
-        help="Minimum allowed heating setpoint (°C).",
-    )
-    p.add_argument(
-        "--max-cool-sp",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_MAX_COOL_SP", "30.0")),
-        help="Maximum allowed cooling setpoint (°C).",
-    )
-    p.add_argument(
-        "--min-deadband",
-        type=float,
-        default=float(os.environ.get("ANDRUIX_MIN_DEADBAND", "0.5")),
-        help="Minimum enforced thermostat deadband (°C).",
-    )
-
-    p.add_argument(
-        "--policy-path",
-        default=os.environ.get("ANDRUIX_POLICY_PATH", os.environ.get("POLICY_PATH", "")),
-        help="Path to policy.pt (TD3 snapshot). Defaults to ANDRUIX_POLICY_PATH (or POLICY_PATH).",
-    )
+    p.add_argument("--min-heat-sp", type=float, default=float(os.environ.get("ANDRUIX_MIN_HEAT_SP", "15.0")))
+    p.add_argument("--max-cool-sp", type=float, default=float(os.environ.get("ANDRUIX_MAX_COOL_SP", "30.0")))
+    p.add_argument("--min-deadband", type=float, default=float(os.environ.get("ANDRUIX_MIN_DEADBAND", "0.5")))
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # Optional: run a shorter simulation by rewriting the IDF RunPeriod to a custom date window.
-    # This is the cleanest way to make a Batch rollout worker run (say) 7 days and then exit.
+    # Optional: windowed run by rewriting RunPeriod
     idf_path = Path(args.idf)
     if args.start_date and args.end_date:
         outdir_for_idf = Path(args.outdir)
@@ -683,12 +838,10 @@ def main():
     idf = idf_path
     epw = Path(args.epw)
     outdir = Path(args.outdir)
-
     if not idf.exists():
         raise FileNotFoundError(f"IDF not found: {idf}")
     if not epw.exists():
         raise FileNotFoundError(f"EPW not found: {epw}")
-
     outdir.mkdir(parents=True, exist_ok=True)
 
     api = EnergyPlusAPI()
@@ -697,7 +850,7 @@ def main():
     controller = RLController(
         api,
         state,
-        zone_name=args.zone,
+        zone_names=args.zones,
         outdir=outdir,
         energy_meter_name=args.energy_meter,
         rollout_dir=Path(args.rollout_dir),
@@ -705,11 +858,14 @@ def main():
         policy_path=args.policy_path,
         policy_kind=args.policy_kind,
         dump_api_available_csv=args.dump_api_csv,
-        debug_meter_every_n_steps=20,
-        reward_mode=args.reward_mode,
+        debug_meter_every_n_steps=1,
         reward_scale=args.reward_scale,
 
-        # Step 1: action semantics + comfort/constraint penalties
+        include_occ_flag=bool(args.include_occ_flag),
+        include_doy_features=(not bool(args.no_doy_features)),
+        include_trend_60m=(not bool(args.no_trend_60m)),
+        include_trend_15m=(not bool(args.no_trend_15m)),
+
         sp_center_min_occ=args.sp_center_min_occ,
         sp_center_max_occ=args.sp_center_max_occ,
         sp_center_min_unocc=args.sp_center_min_unocc,

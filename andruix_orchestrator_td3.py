@@ -46,13 +46,14 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import hashlib
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -78,6 +79,9 @@ def ensure_dirs(shared_root: Path) -> Dict[str, Path]:
         "logs_dir": logs_dir,
     }
 
+def _sha1(a: np.ndarray) -> str:
+    # stable fingerprint for “are these arrays identical?”
+    return hashlib.sha1(np.ascontiguousarray(a).tobytes()).hexdigest()[:10]
 
 def atomic_save_torch(obj: Dict, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -266,6 +270,12 @@ class TD3Learner:
 
             self.q_opt.zero_grad(set_to_none=True)
             q_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                list(self.q1.parameters()) + list(self.q2.parameters()),
+                max_norm=0.5
+            )
+
             self.q_opt.step()
 
             actor_loss = torch.tensor(0.0, device=self.device)
@@ -275,6 +285,7 @@ class TD3Learner:
                 actor_loss = -self.q1(obs, self.actor(obs)).mean()
                 self.actor_opt.zero_grad(set_to_none=True)
                 actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
                 self.actor_opt.step()
 
                 # polyak averaging
@@ -324,53 +335,54 @@ class WorkerSpec:
 
 
 def docker_run_worker(spec: WorkerSpec) -> str:
-    """
-    Launches one rollout container. Returns container_id.
-    Customize env vars/args to match your run_sim_base.py entrypoint.
-    """
-    # Where the worker will write
     rollout_dir = spec.shared_root / "rollouts" / "inbox" / spec.rollout_id
     rollout_dir.mkdir(parents=True, exist_ok=True)
 
     env = {
-        "ANDRUIX_ROLLOUT_ID": spec.rollout_id,
+        "ROLLOUT_ID": spec.rollout_id,
         "ANDRUIX_ROLLOUT_DAYS": str(spec.rollout_days),
         "ANDRUIX_SEED": str(spec.seed),
-        # Worker should read policy from here (inside container)
         "ANDRUIX_POLICY_PATH": "/shared/policy/latest/policy.pt",
-        # Worker should write here (inside container)
-        "ANDRUIX_OUT_DIR": f"/shared/rollouts/inbox/{spec.rollout_id}",
+        "ROLLOUT_DIR": f"/shared/rollouts/inbox/{spec.rollout_id}",
     }
     env.update(spec.extra_env or {})
 
-    cmd = ["docker", "run", "--rm", "-d"]
-    # Resource caps (optional)
+    extra = spec.extra_env or {}
+    zones = extra.get("EPLUS_ZONE")
+    start = extra.get("EPLUS_START_MMDD")
+    end   = extra.get("EPLUS_END_MMDD")
+    if not zones:
+        raise ValueError("EPLUS_ZONE must be provided (comma-separated zone list).")
+    if not start or not end:
+        raise ValueError("EPLUS_START_MMDD and EPLUS_END_MMDD are required (e.g., 07/15, 09/22).")
+
+    cmd = ["docker", "run", "-d", "--name", f"andruix_rollout_{spec.rollout_id}", "--label", f"andruix.rollout_id={spec.rollout_id}"]
     if spec.cpus is not None:
         cmd += ["--cpus", str(spec.cpus)]
     if spec.mem is not None:
         cmd += ["--memory", spec.mem]
 
-    # Mount shared root
     cmd += ["-v", f"{str(spec.shared_root)}:/shared"]
 
-    # Env vars
     for k, v in env.items():
         cmd += ["-e", f"{k}={v}"]
 
-    # Image
     cmd += [spec.image]
 
     cmd += [
         "--rollout-id", spec.rollout_id,
         "--rollout-dir", f"/shared/rollouts/inbox/{spec.rollout_id}",
         "--outdir", f"/shared/results/{spec.rollout_id}",
-        "--start-date", spec.extra_env["ANDRUIX_START_MMDD"],
-        "--end-date", spec.extra_env["ANDRUIX_END_MMDD"],
-        "--policy-kind", spec.extra_env.get("ANDRUIX_POLICY_KIND", "simple"),
-        "--reward-mode", spec.extra_env.get("ANDRUIX_REWARD_MODE", "raw"),
-        "--reward-scale", spec.extra_env.get("ANDRUIX_REWARD_SCALE", "3600000"),
+        "--start-date", start,
+        "--end-date", end,
+        "--policy-kind", extra.get("ANDRUIX_POLICY_KIND", "torch"),
+        "--reward-scale", extra.get("ANDRUIX_REWARD_SCALE", "3600000"),
+        "--comfort-weight", "1.0",
+        "--slew-weight", "0.01",
+        "--energy-meter", "Electricity:HVAC",
+        "--zones", zones,
+        "--policy-path", "/shared/policy/latest/policy.pt",
     ]
-
 
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
@@ -379,21 +391,13 @@ def docker_run_worker(spec: WorkerSpec) -> str:
         raise RuntimeError(f"docker run failed:\n{e.output}") from e
 
 
-def docker_ps(container_id: str) -> bool:
-    """Return True if container is still running."""
+def docker_inspect_status(cid: str) -> str:
     try:
-        out = subprocess.check_output(["docker", "ps", "-q", "--no-trunc"], stderr=subprocess.STDOUT, text=True)
-        # NOTE: Some environments alias 'docker' weirdly; leaving as "docker" below.
-    except Exception:
-        pass
-
-    try:
-        out = subprocess.check_output(["docker", "ps", "-q", "--no-trunc"], stderr=subprocess.STDOUT, text=True)
-        running = set([x.strip() for x in out.splitlines() if x.strip()])
-        return container_id in running
-    except subprocess.CalledProcessError:
-        return False
-
+        out = subprocess.check_output(["docker", "inspect", "--format={{.State.Status}}", cid], text=True).strip()
+        return out
+    except Exception as e:
+        print(f"[docker_inspect_status] cid={cid[:12]} error: {e}")
+        return "unknown"
 
 def docker_stop(container_id: str, timeout_s: int = 10) -> None:
     try:
@@ -402,6 +406,19 @@ def docker_stop(container_id: str, timeout_s: int = 10) -> None:
         # might already be stopped
         pass
 
+def docker_get_logs(container_id: str) -> str:
+    """Return docker logs for a container (stdout+stderr). Container must still exist."""
+    try:
+        return subprocess.check_output(["docker", "logs", container_id], stderr=subprocess.STDOUT, text=True)
+    except subprocess.CalledProcessError as e:
+        return e.output or ""
+
+def docker_rm(container_id: str) -> None:
+    """Remove a stopped container."""
+    try:
+        subprocess.check_call(["docker", "rm", "-f", container_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        pass
 
 # -----------------------------
 # Rollout ingestion
@@ -424,7 +441,15 @@ def list_completed_rollouts(inbox_dir: Path) -> List[Path]:
 
     return sorted(rdirs)
 
-
+def load_rollout_meta_for_npz(npz_path: Path) -> dict:
+    # rollout_<id>.npz -> rollout_<id>.json
+    meta_path = npz_path.with_suffix(".json")
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text())
+    except Exception:
+        return {}
 
 def load_traj_npz(traj_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load a rollout npz safely (ensures file handle is closed; important on Windows)."""
@@ -435,6 +460,10 @@ def load_traj_npz(traj_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
         next_obs = data["next_obs"]
         done = data["done"]
     return obs, act, rew, next_obs, done
+
+def load_traj_extras_npz(traj_path: Path) -> Dict[str, Any]:
+    with np.load(traj_path) as data:
+        return {k: data[k] for k in ("day_of_year","minute_of_day","energy_meter") if k in data.files}
 
 
 # -----------------------------
@@ -458,7 +487,11 @@ class Orchestrator:
         extra_env: Optional[Dict[str, str]] = None,
         tb_logdir: Optional[Path] = None,
         tb_run_name: Optional[str] = None,
-        tb_flush_secs: int = 10
+        tb_flush_secs: int = 10,
+        capture_logs: bool = True,
+        azure_storage_account: Optional[str] = None,
+        azure_storage_container: str = "worker-logs",
+        azure_connection_string: Optional[str] = None
     ):
         self.shared_root = shared_root
         self.paths = ensure_dirs(shared_root)
@@ -471,6 +504,38 @@ class Orchestrator:
         self.worker_cpus = worker_cpus
         self.worker_mem = worker_mem
         self.extra_env = extra_env or {}
+        self.capture_logs = capture_logs
+        self.azure_storage_account = azure_storage_account
+        self.azure_storage_container = azure_storage_container
+        self.azure_connection_string = azure_connection_string
+        self.tb_run_name = tb_run_name or f"run-{int(time.time())}"
+        self.act_dim = act_dim
+        self.obs_dim = obs_dim
+
+
+        self.blob_client = None
+        if azure_storage_account and azure_connection_string:
+            try:
+                from azure.storage.blob import BlobServiceClient
+                self.blob_client = BlobServiceClient.from_connection_string(azure_connection_string)
+                print(f"[orchestrator] Azure Blob client initialized for account: {azure_storage_account}")
+
+                # Get container client
+                self.container_client = self.blob_client.get_container_client(azure_storage_container)
+
+                # Create container if it doesn't exist
+                if not self.container_client.exists():
+                    print(f"[orchestrator] Container '{azure_storage_container}' does not exist. Creating it...")
+                    self.container_client.create_container()
+                    print(f"[orchestrator] Container '{azure_storage_container}' created successfully.")
+                else:
+                    print(f"[orchestrator] Container '{azure_storage_container}' already exists.")
+
+            except Exception as e:
+                print(f"[orchestrator] WARNING: Failed to initialize or create Azure container: {e}. "
+                    "Logs will fall back to local disk.")
+                self.blob_client = None
+                self.container_client = None
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.learner = TD3Learner(obs_dim, act_dim, cfg, self.device)
@@ -555,15 +620,83 @@ class Orchestrator:
             self.active[rollout_id] = cid
             print(f"[orchestrator] launched rollout {rollout_id} -> container {cid}")
 
-    def reap_finished_containers(self) -> None:
-        # Not strictly required if you rely on DONE markers, but useful for visibility.
-        dead = []
-        for rid, cid in self.active.items():
-            if not docker_ps(cid):
-                dead.append(rid)
-        for rid in dead:
-            cid = self.active.pop(rid, "")
-            print(f"[orchestrator] container ended for rollout {rid} (cid={cid})")
+    
+    def reap_finished_containers(self) -> int:
+        to_reap = []
+        for rid, cid in list(self.active.items()):
+            status = docker_inspect_status(cid)
+            if status in ["exited", "dead"]:
+                to_reap.append((rid, cid))
+
+        n_reaped = len(to_reap)
+        if n_reaped == 0:
+            return 0
+
+        print(f"[orchestrator] reaping {n_reaped} finished containers")
+
+        for rid, cid in to_reap:
+            try:
+                docker_stop(cid)
+            except Exception as e:
+                print(f"[orchestrator] WARNING: docker_stop failed rid={rid} cid={cid[:12]}: {e}")
+
+            if self.capture_logs:
+                try:
+                    logs_text = docker_get_logs(cid)
+                    header = (
+                        "===== Andruix worker logs (reaped) =====\n"
+                        f"rollout_id: {rid}\n"
+                        f"container_id: {cid}\n"
+                        f"captured_at_unix: {time.time()}\n"
+                        f"tb_run_name: {self.tb_run_name}\n"
+                        "========================================\n"
+                    )
+                    full_logs = header + logs_text
+
+                    # Determine the "folder" name (virtual for Azure, real for local)
+                    log_folder = self.tb_run_name
+
+                    # Try Azure upload first if configured
+                    uploaded = False
+                    if self.container_client:
+                        try:
+                            # Blob path: <tb_run_name>/worker_<rollout_id>.log
+                            blob_name = f"{log_folder}/worker_{rid}.log"
+
+                            blob_client = self.container_client.get_blob_client(blob_name)
+                            blob_client.upload_blob(full_logs.encode('utf-8'), overwrite=True)
+
+                            # Optional: Set to Cool tier after upload
+                            blob_client.set_standard_blob_tier("Cool")
+
+                            print(f"[orchestrator] Uploaded logs to Azure: "
+                                  f"{self.azure_storage_account}/{self.azure_storage_container}/{blob_name}")
+                            uploaded = True
+                        except Exception as e:
+                            print(f"[orchestrator] WARNING: Azure upload failed for {rid}: {e}. Falling back to local.")
+
+                    # Local fallback (or only path if no Azure)
+                    if not uploaded:
+                        # Create subfolder under logs_dir
+                        run_log_dir = self.paths["logs_dir"] / log_folder
+                        run_log_dir.mkdir(parents=True, exist_ok=True)
+
+                        log_path = run_log_dir / f"worker_{rid}.log"
+                        log_path.write_text(full_logs, encoding="utf-8")
+                        print(f"[orchestrator] Wrote local logs -> {log_path}")
+
+                except Exception as e:
+                    print(f"[orchestrator] WARNING: failed to capture/save logs rid={rid} cid={cid[:12]}: {e}")
+
+            try:
+                docker_rm(cid)
+            except Exception as e:
+                print(f"[orchestrator] WARNING: docker_rm failed rid={rid} cid={cid[:12]}: {e}")
+
+            # Remove from active (key fix to avoid re-reaping)
+            del self.active[rid]
+
+        return n_reaped
 
     def ingest_completed_rollouts(self) -> int:
         inbox_dir = self.paths["inbox_dir"]
@@ -588,10 +721,66 @@ class Orchestrator:
 
             try:
                 obs, act, rew, next_obs, done = load_traj_npz(npz_path)
+                meta = load_rollout_meta_for_npz(npz_path)
+                zones = meta.get("zones") or []
+
+                # If zones exist, verify act_dim matches len(zones)
+                if zones and act.ndim == 2 and act.shape[1] != len(zones):
+                    raise ValueError(f"{rdir.name}: act_dim {act.shape[1]} != len(zones) {len(zones)}")
+
+                # If orchestrator has an expected zone list, verify exact match (ordering matters!)
+                expected = self.extra_env.get("EPLUS_ZONE", "")
+                expected_zones = [z.strip() for z in expected.split(",") if z.strip()]
+                if zones and expected_zones and zones != expected_zones:
+                    raise ValueError(f"{rdir.name}: zones mismatch expected={expected_zones} got={zones}")
+
+                # After loading obs/act...
+                if act.ndim == 2 and obs.ndim == 2:
+                    if act.shape[0] != obs.shape[0]:
+                        raise ValueError(f"timestep mismatch: act={act.shape} obs={obs.shape}")
+                    if act.shape[1] != self.act_dim:
+                        raise ValueError(f"act_dim mismatch: act has {act.shape[1]} but args.act_dim={self.act_dim}")
+                    if obs.shape[1] != self.obs_dim:
+                        raise ValueError(f"obs_dim mismatch: obs has {obs.shape[1]} but args.obs_dim={self.obs_dim}")
+
+                # act debug delete me later
+                act_arr = np.asarray(act)
+                act_mean = float(np.mean(act_arr))
+                act_std  = float(np.std(act_arr))
+                act_min  = float(np.min(act_arr))
+                act_max  = float(np.max(act_arr))
+
+                rew_sha = _sha1(rew)
+                act_sha = _sha1(act)
+
+                print(
+                    f"[orchestrator] rollout={rdir.name} "
+                    f"act(mean={act_mean:.4f}, std={act_std:.4f}, min={act_min:.4f}, max={act_max:.4f}) "
+                    f"sha(rew={rew_sha}, act={act_sha})"
+                )
+                # act debug delete me later
+
                 added = self.rb.add_batch(obs, act, rew, next_obs, done)
                 ingested += 1
                 self.rollouts_ingested += 1
-                print(f"[orchestrator] ingested rollout={rdir.name} transitions={added} buffer_size={self.rb.size}")
+
+                # Reward statistics for debugging ingestion
+                rew_arr = np.asarray(rew, dtype=np.float32)
+                nan_ct = int(np.isnan(rew_arr).sum())
+                if nan_ct:
+                    print(f"[orchestrator] WARNING: rollout={rdir.name} has {nan_ct} NaN rewards")
+                rew_mean = float(np.nanmean(rew_arr))
+                rew_std = float(np.nanstd(rew_arr))
+                rew_min = float(np.nanmin(rew_arr))
+                rew_max = float(np.nanmax(rew_arr))
+                rew_sum = float(np.nansum(rew_arr))
+                nsteps = int(rew_arr.shape[0])
+                print(
+                    f"[orchestrator] ingested rollout={rdir.name} transitions={added} buffer_size={self.rb.size} "
+                    f"steps={nsteps} return={rew_sum:.4f} mean={rew_mean:.6f} std={rew_std:.6f} "
+                    f"min={rew_min:.6f} max={rew_max:.6f} npz={npz_path.name}"
+                )
+
                 # TensorBoard rollout metrics
                 if self.writer is not None:
                     ep_return = float(np.sum(rew))
@@ -639,14 +828,50 @@ class Orchestrator:
     def stop(self) -> None:
         self._stop = True
         print("[orchestrator] stopping... stopping active containers")
+
+        # Stop and capture logs for any active containers
         for rid, cid in list(self.active.items()):
             print(f"[orchestrator] stopping rollout {rid} cid={cid}")
-            docker_stop(cid, timeout_s=10)
+
+            # Stop container (best-effort)
+            try:
+                docker_stop(cid, timeout_s=10)
+            except Exception as e:
+                print(f"[orchestrator] WARNING: docker_stop failed rid={rid} cid={cid}: {e}")
+
+            # Capture logs (best-effort)
+            try:
+                logs_text = docker_get_logs(cid)
+                log_path = self.paths["logs_dir"] / f"worker_{rid}.log"
+                header = (
+                    "===== Andruix worker logs (stopped) =====\n"
+                    f"rollout_id: {rid}\n"
+                    f"container_id: {cid}\n"
+                    f"captured_at_unix: {time.time()}\n"
+                    "========================================\n"
+                )
+                log_path.write_text(header + logs_text, encoding="utf-8")
+                print(f"[orchestrator] wrote worker logs -> {log_path}")
+            except Exception as e:
+                print(f"[orchestrator] WARNING: failed to capture logs rid={rid} cid={cid}: {e}")
+
+            # Remove container (best-effort)
+            try:
+                docker_rm(cid)
+            except Exception as e:
+                print(f"[orchestrator] WARNING: docker_rm failed rid={rid} cid={cid}: {e}")
+
+        # Clear after loop
         self.active.clear()
 
-        if hasattr(self, 'writer') and self.writer is not None:
-            self.writer.flush()
-            self.writer.close()
+        # Flush TB writer
+        if hasattr(self, "writer") and self.writer is not None:
+            try:
+                self.writer.flush()
+                self.writer.close()
+            except Exception as e:
+                print(f"[orchestrator] WARNING: failed to close writer: {e}")
+
 
     def run_forever(self, poll_s: float = 2.0) -> None:
         def _sig_handler(signum, frame):
@@ -697,12 +922,15 @@ def parse_args() -> argparse.Namespace:
     # TD3 knobs (starter defaults)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
-    p.add_argument("--policy-noise", type=float, default=0.2)
+    p.add_argument("--policy-noise", type=float, default=0.1)
     p.add_argument("--noise-clip", type=float, default=0.5)
     p.add_argument("--policy-delay", type=int, default=2)
     p.add_argument("--actor-lr", type=float, default=1e-3)
     p.add_argument("--critic-lr", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--capture-logs", action="store_true", default=True, help="Capture and save Docker container logs (default: True). Disable for performance.")
+    p.add_argument("--azure-storage-account", type=str, default="arduixpoca", help="Azure Storage Account name for uploading logs (optional; falls back to local disk).")
+    p.add_argument("--azure-storage-container", type=str, default="worker-logs", help="Azure Blob container for logs (default: worker-logs).")
 
     # Pass-through env to containers (repeatable key=value)
     p.add_argument("--env", action="append", default=[], help="Extra env var for workers, format KEY=VALUE (repeatable)")
@@ -713,6 +941,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     shared_root = Path(args.shared_root).resolve()
+
+    # Determine Azure connection string: CLI arg takes precedence over env var
+
+    azure_conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    if azure_conn_str:
+        print("[orchestrator] Using Azure connection string from environment variable AZURE_STORAGE_CONNECTION_STRING")
+    else:
+        print("[orchestrator] No Azure connection string provided (neither CLI nor AZURE_STORAGE_CONNECTION_STRING env var). "
+                "Logs will be saved locally only.")
 
     extra_env: Dict[str, str] = {}
     for item in args.env:
@@ -749,7 +986,11 @@ def main() -> int:
         extra_env=extra_env,
         tb_logdir=(Path(args.tb_logdir).resolve() if args.tb_logdir else None),
         tb_run_name=args.tb_run_name,
-        tb_flush_secs=args.tb_flush_secs
+        tb_flush_secs=args.tb_flush_secs,
+        capture_logs=args.capture_logs,
+        azure_storage_account=args.azure_storage_account,
+        azure_storage_container=args.azure_storage_container,
+        azure_connection_string=azure_conn_str
     )
     orch.run_forever(poll_s=2.0)
     return 0
