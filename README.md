@@ -22,16 +22,20 @@ docker run --rm --name eplus-test -v "${PWD}\results:/home/guser/results" eplus-
 
 ### Smoke test docker file 
 '''
-docker build -t andruix/eplus:latest -f Dockerfile .
+docker build -t andruix/eplus:latest -f DockerFile .
 
-docker run --rm -it -v "${pwd}\shared:/shared" andruix/eplus:latest `
-  --rollout-id raw-test `
-  --rollout-dir /shared/rollouts/inbox/raw-test `
-  --outdir /shared/results/raw-test `
-  --start-date 06/10 --end-date 06/17 `
-  --policy-kind torch `
-  --reward-mode raw `
-  --reward-scale 3600000
+docker run --rm \
+  -v ~/arduix/and-hvac-v1/shared:/shared \
+  andruix/eplus:latest \
+  --outdir /shared/results/test_short \
+  --rollout-dir /shared/rollouts/inbox/test_short \
+  --rollout-id test_short_5zones \
+  --zones "PERIMETER_BOT_ZN_3,CORE_BOTTOM,PERIMETER_BOT_ZN_4,PERIMETER_BOT_ZN_2,PERIMETER_BOT_ZN_1" \
+  --start-date 01/01 \
+  --end-date 01/03 \
+  --policy-kind simple \
+  --energy-meter "Electricity:HVAC" \
+  --reward-scale 3.6e6
 '''
 
 ### create Shared Folder Once 
@@ -45,33 +49,43 @@ mkdir shared\logs -ErrorAction SilentlyContinue | Out-Null
 
 ### Smoke Test orchestrator file 
 '''
-docker build -t andruix/eplus:latest -f Dockerfile .
+source ~/arduix_env/bin/activate
+
+docker build -t andruix/eplus:latest -f DockerFile .
 
 # Add to your shell profile (so it's set every login)
-echo 'export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=youraccount;AccountKey=yourkey;EndpointSuffix=core.windows.net"' >> ~/.bashrc
+echo 'export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=arduixpoca;AccountKey=<key>;EndpointSuffix=core.windows.net"' >> ~/.bashrc
 
 # Or for current session only
-export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=youraccount;AccountKey=yourkey;EndpointSuffix=core.windows.net"
+export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=arduixpoca;AccountKey=<key>;EndpointSuffix=core.windows.net;EndpointSuffix=core.windows.net"
 
-python .\andruix_orchestrator_td3.py `
-  --shared-root .\shared `
-  --image andruix/eplus:latest `
-  --obs-dim 11 `
-  --act-dim 1 `
-  --max-workers 2 `
-  --rollout-days 7 `
-  --batch-size 64 `
-  --min-replay-before-train 6000 `
-  --train-steps-per-rollout 200 `
-  --publish-every-rollouts 5 `
-  --actor-lr=3e-4 `
-  --critic-lr=1e-4 `
-  --env EPLUS_START_MMDD=07/15 `
-  --env EPLUS_END_MMDD=07/22 `
-  --env ANDRUIX_POLICY_KIND=torch `
-  --tb-run-name denver_july15_smoke2 `
-  --env ANDRUIX_REWARD_MODE=raw `
-  --env ANDRUIX_REWARD_SCALE=3600000
+python3 andruix_orchestrator_td3.py \
+  --shared-root /home/anduser/arduix/and-hvac-v1/shared \
+  --image andruix/eplus:latest \
+  --obs-dim 15 \
+  --act-dim 5 \
+  --max-workers 1 \
+  --rollout-days 2 \
+  --batch-size 256 \
+  --min-replay-before-train 10000 \
+  --train-steps-per-rollout 500 \
+  --publish-every-rollouts 1 \
+  --actor-lr 1e-4 \
+  --critic-lr 7e-5 \
+  --policy-noise .4 \
+  --tb-run-name denver_july15_mz_1_2 \
+  --env EPLUS_START_MMDD=07/15 \
+  --env EPLUS_END_MMDD=09/22 \
+  --env "EPLUS_ZONE=PERIMETER_BOT_ZN_1,PERIMETER_BOT_ZN_2,PERIMETER_BOT_ZN_3,PERIMETER_BOT_ZN_4,CORE_BOTTOM" \
+  --env "ANDRUIX_POLICY_KIND=torch" \
+  --env "ANDRUIX_POLICY_PATH=/shared/policy/latest/policy.pt" \
+  --env "ANDRUIX_REWARD_MODE=raw" \
+  --env "ANDRUIX_REWARD_SCALE=3600000" \
+  --env "ANDRUIX_OBS_OCC=1" \
+  --env "ANDRUIX_OBS_NO_DOY=0" \
+  --env "ANDRUIX_OBS_NO_TREND_15M=0" \
+  --env "ANDRUIX_OBS_NO_TREND_60M=0" \
+  --env "ANDRUIX_EXPLORE_NOISE=0.10"
 
 '''
 
@@ -154,6 +168,7 @@ source ~/arduix_env/bin/activate
 pip install --upgrade pip
 pip install numpy torch tensorboard tensorboardX  # tensorboardX if needed for older compat
 pip install torch torchvision torchaudio  # For full Torch support
+pip install azure-storage-blob azure-identity
 
 # If you have a GPU and want CUDA (check with `nvidia-smi` if drivers are installed)
 # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118  # Adjust CUDA version as needed
@@ -162,7 +177,74 @@ pip install torch torchvision torchaudio  # For full Torch support
 deactivate
 
 # Verify
-source ~/andruix_env/bin/activate
+source ~/arduix_env/bin/activate
 python -c "import torch; print(torch.__version__); print('CUDA available:', torch.cuda.is_available())"
 deactivate
 '''
+
+### setup tensorboard on remote vm 
+'''
+1) start training script 
+
+2) in another shell ssh in and execute 
+# Activate venv again (if needed)
+source ~/arduix_env/bin/activate
+
+# Go to the directory where shared/tb lives
+cd ~/arduix/and-hvac-v1
+
+# Run TensorBoard pointing at the correct path
+tensorboard --logdir shared/tb --host 0.0.0.0 --port 6006
+
+3) Setup ssh tunnel from windows pc to remote vm 
+ssh -i C:\Users\succi\.ssh\and_gpu.pem -f -N -L 6006:localhost:6006 anduser@20.57.140.254
+
+4) visit browser 
+http://localhost:6006
+
+### Worker timeseries metrics + plotting (debug)
+
+Each rollout worker writes a compact per-timestep timeseries file alongside the normal replay rollout:
+- `shared/results/<rollout_id>/timeseries_<rollout_id>.parquet` (preferred)
+- falls back to `.csv` if parquet deps aren’t available
+
+#### How to add metrics (WorkerTimeseriesWriter)
+The worker builds a single “row” per timestep in the callbacks and appends it via:
+`self.ts_writer.append_step(..., extra_scalars={...})`
+
+To add new metrics:
+- **Scalar (single value per timestep):** add it to `extra_scalars` in `end_system_timestep_callback`
+  - Example: `extra_scalars={"occupied": float(occupied), "comfort_pen": float(comfort_pen)}`
+- **Per-zone scalar:** add a dict to one of the per-zone dict args (`zone_temps_c`, `zone_setpoints_heat_c`, `zone_setpoints_cool_c`, `zone_actions_norm`)
+  - New per-zone series will show up as columns like `tz_c__CORE_BOTTOM`, `cool_sp_c__CORE_BOTTOM`, etc.
+
+#### Plot a rollout’s timeseries
+From your PC (or any machine with Python), run:
+
+```bash
+python plot_worker_rollout.py `
+  --path .\timeseries\timeseries_fe698c28deb7.parquet `
+  --zones "CORE_BOTTOM,PERIMETER_BOT_ZN_3" `
+  --resample 15min `
+  --start-step 5000 `
+  --end-step 6500
+```
+
+#### PC dependencies for plotting - Create/activate a venv and install:
+```bash
+pip install pandas pyarrow matplotlib numpy
+```
+
+#### Example (run on your PC Powershell) to copy a single rollout’s parquet down to the current directory:
+```bash
+scp -i ~/.ssh/and_gpu.pem `
+  anduser@20.57.140.254:/home/anduser/arduix/and-hvac-v1/shared/results/<rollout_id>/timeseries_<rollout_id>.parquet `
+  .
+```
+
+#### Or copy all rollout timeseries files:
+```
+scp -i ~/.ssh/and_gpu.pem `
+  anduser@20.57.140.254:/home/anduser/arduix/and-hvac-v1/shared/results/*/timeseries_*.parquet `
+  .
+```
