@@ -81,6 +81,7 @@ class TorchPolicyModel:
 
         self._load_or_fallback()
 
+    @staticmethod
     def file_sha1(path: Path, chunk_size: int = 1024 * 1024) -> str:
         """SHA1 of a file (streamed) so we can verify workers loaded the same policy."""
         h = hashlib.sha1()
