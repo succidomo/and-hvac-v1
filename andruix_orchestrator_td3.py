@@ -756,7 +756,7 @@ class Orchestrator:
                 print(
                     f"[orchestrator] rollout={rdir.name} "
                     f"act(mean={act_mean:.4f}, std={act_std:.4f}, min={act_min:.4f}, max={act_max:.4f}) "
-                    f"sha(rew={rew_sha}, act={act_sha})"
+                    f"sha(rew={rew_sha}, act={act_sha}, policy hash={meta["policy_fingerprint"]})"
                 )
                 # act debug delete me later
 

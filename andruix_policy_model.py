@@ -13,6 +13,8 @@ from typing import Sequence, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import hashlib
+from typing import Optional
 
 
 def mlp(in_dim: int, out_dim: int, hidden: Sequence[int] = (256, 256)) -> nn.Module:
@@ -79,12 +81,21 @@ class TorchPolicyModel:
 
         self._load_or_fallback()
 
+    def file_sha1(path: Path, chunk_size: int = 1024 * 1024) -> str:
+        """SHA1 of a file (streamed) so we can verify workers loaded the same policy."""
+        h = hashlib.sha1()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
     def _load_or_fallback(self) -> None:
         if not self.policy_path or not self.policy_path.exists():
             print(f"[policy] No policy found at {self.policy_path}; using default setpoint={self.default_sp}")
             return
 
         try:
+            self.policy_hash = self.file_sha1(self.policy_path)
             ckpt = torch.load(self.policy_path, map_location="cpu")
             td3 = ckpt.get("td3", ckpt)
             cfg = td3.get("cfg", {}) or {}
@@ -104,13 +115,14 @@ class TorchPolicyModel:
             note = meta.get("note", "")
             print(
                 f"[policy] Loaded policy '{self.policy_path}' obs_dim={self.obs_dim} act_dim={self.act_dim} "
-                f"act_limit={self.act_limit} mode={self.action_mode} note='{note}'"
+                f"act_limit={self.act_limit} mode={self.action_mode} note='{note}' policy hash='{self.policy_hash}'"
             )
         except Exception as e:
             self.actor = None
             self.obs_dim = None
             self.act_dim = None
             print(f"[policy] Failed to load policy at {self.policy_path}: {e}. Using default setpoint={self.default_sp}")
+
 
     @torch.no_grad()
     def get_action(self, state_vec: np.ndarray) -> float:

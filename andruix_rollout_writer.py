@@ -169,7 +169,7 @@ class RolloutWriter:
             reward_mode=self.reward_mode,
             reward_scale=self.reward_scale,
             obs_flags=self.obs_flags,
-            # optional: policy_fingerprint=self.policy_fingerprint,
+            policy_fingerprint=self.policy_fingerprint,
         )
         (self.rollout_dir / f"rollout_{self.rollout_id}.json").write_text(
             json.dumps(meta.__dict__, indent=2)
@@ -258,6 +258,9 @@ class WorkerTimeseriesWriter:
         if zone_actions_norm:
             for z, v in zone_actions_norm.items():
                 row[self._safe_zone_col("act_norm", z)] = float(v)
+
+        if self.policy_fingerprint:
+            row["policy_hash"] = self.policy_fingerprint
 
         # Easy extension point: add any scalar metric without changing schema code
         if extra_scalars:

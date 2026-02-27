@@ -176,6 +176,7 @@ class RLController:
                 "no_trend_15m": bool(int(os.getenv("ANDRUIX_OBS_NO_TREND_15M", "0"))),
                 "no_trend_60m": bool(int(os.getenv("ANDRUIX_OBS_NO_TREND_60M", "0"))),
             },
+            policy_fingerprint=getattr(self.rl_model, "policy_hash", None),
         )
 
         # Per-worker debug timeseries writer (parquet/csv) keyed by rollout_id
@@ -183,8 +184,8 @@ class RLController:
             out_dir=self.outdir,          # writes to /shared/results/<rollout_id>/ (your --outdir)
             rollout_id=self.rollout_id,
             zones=self.ZONES,
-            policy_fingerprint=os.getenv("ANDRUIX_POLICY_SHA") or None,
             image_tag=os.getenv("ANDRUIX_IMAGE_TAG") or None,
+            policy_fingerprint=getattr(self.rl_model, "policy_hash", None),
         )
         self._ts_pending = None  # begin-callback stash; flushed in end-callback
 
@@ -667,9 +668,9 @@ class RLController:
             return
 
         # Raw timestep meter value (J) -> kWh (if reward_scale=3.6e6)
-        use_val = float(raw_val)
-        scale = self.reward_scale if self.reward_scale != 0.0 else 1.0
-        energy_kwh = use_val / scale
+        energy_kwh = float(raw_val) / 3_600_000.0
+
+        energy_term = energy_kwh / self.reward_scale
 
         # 5. Comfort & hard penalties — per-zone, then average
         comfort_pen = 0.0
@@ -713,7 +714,7 @@ class RLController:
             slew_pen = slew_sum / max(1, len(self.ZONES))
 
         # 7. Total reward
-        rew = -energy_kwh - comfort_pen - hard_pen - slew_pen
+        rew = -energy_term - comfort_pen - hard_pen - slew_pen
 
         # 8. Step count & debug print (updated for multi-zone summary)
         self.step_count += 1
@@ -721,7 +722,7 @@ class RLController:
             meter_str = f"raw={raw_val:.2f}"
             avg_tz = np.nanmean(list(zone_temps.values())) if zone_temps else np.nan
             print(
-                f"[step {self.step_count}] {meter_str} kWh={energy_kwh:.4f} "
+                f"[step {self.step_count}] {meter_str} kWh={energy_kwh:.4f} energy term={energy_term:.4f}"
                 f"avg_Tz={avg_tz:.2f}C occ={occupied} "
                 f"pen(c={comfort_pen:.3f}, h={hard_pen:.3f}, s={slew_pen:.3f}) rew={rew:.4f}"
             )
