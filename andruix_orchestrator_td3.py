@@ -753,10 +753,11 @@ class Orchestrator:
                 rew_sha = _sha1(rew)
                 act_sha = _sha1(act)
 
+                policy_fp = meta.get("policy_fingerprint", "NA")
                 print(
                     f"[orchestrator] rollout={rdir.name} "
                     f"act(mean={act_mean:.4f}, std={act_std:.4f}, min={act_min:.4f}, max={act_max:.4f}) "
-                    f"sha(rew={rew_sha}, act={act_sha}, policy hash={meta["policy_fingerprint"]})"
+                    f"sha(rew={rew_sha}, act={act_sha}) policy_fp={policy_fp}"
                 )
                 # act debug delete me later
 
@@ -774,10 +775,14 @@ class Orchestrator:
                 rew_min = float(np.nanmin(rew_arr))
                 rew_max = float(np.nanmax(rew_arr))
                 rew_sum = float(np.nansum(rew_arr))
+                
+                st = npz_path.stat()
+                npz_size_bytes = int(st.st_size)  
                 nsteps = int(rew_arr.shape[0])
+
                 print(
                     f"[orchestrator] ingested rollout={rdir.name} transitions={added} buffer_size={self.rb.size} "
-                    f"steps={nsteps} return={rew_sum:.4f} mean={rew_mean:.6f} std={rew_std:.6f} "
+                    f"steps={nsteps} npz_size={npz_size_bytes}B return={rew_sum:.4f} mean={rew_mean:.6f} std={rew_std:.6f} "
                     f"min={rew_min:.6f} max={rew_max:.6f} npz={npz_path.name}"
                 )
 
