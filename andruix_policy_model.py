@@ -126,22 +126,16 @@ class TorchPolicyModel:
 
 
     @torch.no_grad()
-    def get_action(self, state_vec: np.ndarray) -> float:
-        """Return a normalized action in [-1, 1] given an observation vector."""
-        if self.actor is None:
-            return 0.0  # neutral action => mid setpoint
+    def get_action(self, state_vec: np.ndarray) -> np.ndarray:
+        if self.actor is None or self.act_dim is None:
+            return np.zeros((int(self.act_dim or 1),), dtype=np.float32)
 
         s = np.asarray(state_vec, dtype=np.float32).reshape(1, -1)
         if self.obs_dim is not None and s.shape[1] != self.obs_dim:
             raise ValueError(f"state_vec dim mismatch: got {s.shape[1]} expected {self.obs_dim}")
 
         obs_t = torch.from_numpy(s).to(self.device)
-        act_t = self.actor(obs_t)  # should already be tanh-bounded if your Actor ends with tanh
-        a0 = float(act_t.detach().cpu().numpy().reshape(-1)[0])
-
-        # If your actor is scaled by act_limit in the learner, normalize here.
-        denom = self.act_limit if abs(self.act_limit) > 1e-6 else 1.0
-        a_norm = float(np.clip(a0 / denom, -1.0, 1.0))
-
-        return a_norm
+        act_t = self.actor(obs_t)                 # expected shape [1, act_dim]
+        a = act_t.detach().cpu().numpy().reshape(-1).astype(np.float32)
+        return a
 

@@ -565,31 +565,41 @@ class RLController:
             self._pending_energy = None
 
         # 7) Policy action (normalized per zone)
-        a_raw = self.rl_model.get_action(obs)
-        a_raw_arr = np.asarray(a_raw, dtype=np.float32).reshape(-1)
-        print(f"[a_pol] type={type(a_raw).__name__} shape={a_raw_arr.shape} sample={a_raw_arr[:min(5,a_raw_arr.size)]}")
+        a_pol = np.asarray(self.rl_model.get_action(obs), dtype=np.float32).reshape(-1)
+        print(f"[a_pol] shape={a_pol.shape} sample={a_pol[:min(5, a_pol.size)]}")
 
-        explore_noise = float(os.environ.get('ANDRUIX_EXPLORE_NOISE', '0.0'))
+        # If policy returns scalar, replicate across zones (explicit behavior)
+        if a_pol.size == 1:
+            a_pol = np.full((len(self.ZONES),), float(a_pol.item()), dtype=np.float32)
+
+        # Exploration noise (training rollouts)
+        explore_noise = float(os.environ.get("ANDRUIX_EXPLORE_NOISE", "0.0"))
+        a_raw = a_pol.copy()
         if explore_noise > 0.0:
-            a_raw = np.asarray(a_raw, dtype=np.float32).reshape(-1) + np.random.normal(0.0, explore_noise, size=len(self.ZONES)).astype(np.float32)
-        
+            a_raw = a_raw + np.random.normal(0.0, explore_noise, size=len(self.ZONES)).astype(np.float32)
+
+        # Coerce/clamp to [-1, 1] and ensure correct length
         a_norm = self._coerce_action_vec(a_raw, n=len(self.ZONES))
 
-        ar = np.asarray(a_raw)
-        an = np.asarray(a_norm)
-
+        # Debug
         print(
             "[a_dbg]"
-            f" a_raw(type={type(a_raw).__name__}, shape={ar.shape}, dtype={ar.dtype if hasattr(ar,'dtype') else 'n/a'})"
-            f" min={np.nanmin(ar):.4f} max={np.nanmax(ar):.4f} mean={np.nanmean(ar):.4f}"
-            f" any_nonfinite={np.any(~np.isfinite(ar))}"
-            f" sample={ar.reshape(-1)[:min(5, ar.size)]}"
+            f" a_raw(shape={a_raw.shape}, dtype={a_raw.dtype})"
+            f" min={np.nanmin(a_raw):.4f} max={np.nanmax(a_raw):.4f} mean={np.nanmean(a_raw):.4f}"
+            f" any_nonfinite={np.any(~np.isfinite(a_raw))}"
+            f" sample={a_raw[:min(5, a_raw.size)]}"
             " |"
-            f" a_norm(shape={an.shape}, dtype={an.dtype})"
-            f" min={np.nanmin(an):.4f} max={np.nanmax(an):.4f} mean={np.nanmean(an):.4f}"
-            f" any_nonfinite={np.any(~np.isfinite(an))}"
-            f" sample={an.reshape(-1)[:min(5, an.size)]}"
+            f" a_norm(shape={a_norm.shape}, dtype={a_norm.dtype})"
+            f" min={np.nanmin(a_norm):.4f} max={np.nanmax(a_norm):.4f} mean={np.nanmean(a_norm):.4f}"
+            f" any_nonfinite={np.any(~np.isfinite(a_norm))}"
+            f" sample={a_norm[:min(5, a_norm.size)]}"
         )
+
+        # --- Sanity: action saturation rate (how often actions hit bounds) ---
+        sat_thresh = 0.98
+        sat_frac = float(np.mean(np.abs(a_norm) >= sat_thresh))
+        if self.step_count % 20 == 0:  # adjust cadence as you like
+            print(f"[a_sat] frac(|a_norm|>={sat_thresh})={sat_frac:.2f}  a_norm={np.round(a_norm,3)}")
 
         # Prepare dicts for timeseries logging
         zone_actions_norm = {z: float(a_norm[i]) for i, z in enumerate(self.ZONES)}
