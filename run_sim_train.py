@@ -566,6 +566,9 @@ class RLController:
 
         # 7) Policy action (normalized per zone)
         a_raw = self.rl_model.get_action(obs)
+        a_raw_arr = np.asarray(a_raw, dtype=np.float32).reshape(-1)
+        print(f"[a_pol] type={type(a_raw).__name__} shape={a_raw_arr.shape} sample={a_raw_arr[:min(5,a_raw_arr.size)]}")
+
         explore_noise = float(os.environ.get('ANDRUIX_EXPLORE_NOISE', '0.0'))
         if explore_noise > 0.0:
             a_raw = np.asarray(a_raw, dtype=np.float32).reshape(-1) + np.random.normal(0.0, explore_noise, size=len(self.ZONES)).astype(np.float32)
