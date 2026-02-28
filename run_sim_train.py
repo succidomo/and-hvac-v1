@@ -593,6 +593,7 @@ class RLController:
             f" min={np.nanmin(a_norm):.4f} max={np.nanmax(a_norm):.4f} mean={np.nanmean(a_norm):.4f}"
             f" any_nonfinite={np.any(~np.isfinite(a_norm))}"
             f" sample={a_norm[:min(5, a_norm.size)]}"
+            f" outside_temp={outside_temp:.4f}"
         )
 
         # --- Sanity: action saturation rate (how often actions hit bounds) ---
@@ -735,8 +736,8 @@ class RLController:
             meter_str = f"raw={raw_val:.2f}"
             avg_tz = np.nanmean(list(zone_temps.values())) if zone_temps else np.nan
             print(
-                f"[step {self.step_count}] {meter_str} kWh={energy_kwh:.4f} energy term={energy_term:.4f}"
-                f"avg_Tz={avg_tz:.2f}C occ={occupied} "
+                f"[step {self.step_count}] dayofyr={self._prev_day_of_year} min={self._prev_minute_of_day} {meter_str} kWh={energy_kwh:.4f} energy term={energy_term:.4f}"
+                f"avg_Tz={avg_tz:.2f}C occ={occupied} outside_temp={outside_temp:.2f}"
                 f"pen(c={comfort_pen:.3f}, h={hard_pen:.3f}, s={slew_pen:.3f}) rew={rew:.4f}"
             )
 
