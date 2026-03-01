@@ -344,6 +344,7 @@ def docker_run_worker(spec: WorkerSpec) -> str:
         "ANDRUIX_SEED": str(spec.seed),
         "ANDRUIX_POLICY_PATH": "/shared/policy/latest/policy.pt",
         "ROLLOUT_DIR": f"/shared/rollouts/inbox/{spec.rollout_id}",
+        "ANDRUIX_UNCOMFORT_MIN_WEIGHT": "0.5",
     }
     env.update(spec.extra_env or {})
 
@@ -459,7 +460,8 @@ def load_traj_npz(traj_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
         rew = data["rew"]
         next_obs = data["next_obs"]
         done = data["done"]
-    return obs, act, rew, next_obs, done
+        energy_meter = data["energy_meter"]
+    return obs, act, rew, next_obs, done, energy_meter
 
 def load_traj_extras_npz(traj_path: Path) -> Dict[str, Any]:
     with np.load(traj_path) as data:
@@ -720,7 +722,7 @@ class Orchestrator:
                 continue
 
             try:
-                obs, act, rew, next_obs, done = load_traj_npz(npz_path)
+                obs, act, rew, next_obs, done, energy_meter = load_traj_npz(npz_path)
                 meta = load_rollout_meta_for_npz(npz_path)
                 zones = meta.get("zones") or []
 
@@ -789,11 +791,14 @@ class Orchestrator:
                 # TensorBoard rollout metrics
                 if self.writer is not None:
                     ep_return = float(np.sum(rew))
+                    energy_arr = np.asarray(energy_meter, dtype=np.float32) 
                     self.writer.add_scalar('rollout/transitions', int(added), self.rollouts_ingested)
                     self.writer.add_scalar('rollout/episode_return', ep_return, self.rollouts_ingested)
                     self.writer.add_scalar('rollout/mean_reward', float(np.mean(rew)), self.rollouts_ingested)
                     self.writer.add_scalar('rollout/min_reward', float(np.min(rew)), self.rollouts_ingested)
                     self.writer.add_scalar('rollout/max_reward', float(np.max(rew)), self.rollouts_ingested)
+                    self.writer.add_scalar('rollout/energy_kwh_sum', float(np.sum(energy_arr)), self.rollouts_ingested)
+                    self.writer.add_scalar('rollout/energy_kwh_mean', float(np.mean(energy_arr)), self.rollouts_ingested)
                     self.writer.add_scalar('buffer/size', int(self.rb.size), self.rollouts_ingested)
             except Exception as e:
                 print(f"[orchestrator] ERROR ingesting {rdir}: {e}")

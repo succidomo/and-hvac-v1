@@ -80,6 +80,7 @@ class RLController:
         min_heat_sp: float = 15.0,
         max_cool_sp: float = 30.0,
         min_deadband: float = 0.5,
+        control_minutes: int = 15,
     ):
         self.api = api
         self.state = state
@@ -121,6 +122,41 @@ class RLController:
         self.dump_api_available_csv = dump_api_available_csv
         self.debug_meter_every_n_steps = debug_meter_every_n_steps
         self.reward_scale = float(reward_scale) if reward_scale else 1.0
+
+        # ---- Control interval (aggregate SystemTimesteps into one RL step) ----
+        self.control_minutes = int(control_minutes) if control_minutes else 15
+        self._bucket_id = None
+
+        # bucket accumulators (sum over SystemTimesteps)
+        self._bucket_rew = 0.0
+        self._bucket_energy_kwh_sum = 0.0
+        self._bucket_sys_steps = 0
+        self._bucket_uncomfort_min = 0.0
+
+        # minute tracking to avoid over-counting sub-minute callbacks
+        self._bucket_last_mod = None
+        self._last_uncomfortable = False
+
+        # weight for minutes-uncomfortable (env configurable)
+        self.uncomfort_min_weight = float(os.environ.get("ANDRUIX_UNCOMFORT_MIN_WEIGHT", "1.0"))
+
+        # last seen time (for trend history de-dupe)
+        self._last_hist_abs_minute = None
+
+        # debug counters
+        self.sys_step_count = 0      # raw EnergyPlus SystemTimesteps
+        self.step_count = 0          # RL control steps (15-min buckets)
+
+        # “current policy outputs that are being held”
+        self._held_act = np.zeros((len(self.ZONES),), dtype=np.float32)
+        self._held_heat_sp = {z: None for z in self.ZONES}
+        self._held_cool_sp = {z: None for z in self.ZONES}
+
+        # last known state snapshot (so finalize() can write last bucket row)
+        self._last_zone_temps = None
+        self._last_outside_temp = None
+        self._last_doy = None
+        self._last_mod = None
 
         # ---- Action mapping config ----
         self.sp_center_min_occ = float(sp_center_min_occ)
@@ -229,8 +265,16 @@ class RLController:
 
         # Callbacks
         self.api.runtime.callback_after_new_environment_warmup_complete(state, self._try_init_handles)
-        self.api.runtime.callback_begin_zone_timestep_before_init_heat_balance(state, self.begin_timestep_callback)
-        self.api.runtime.callback_end_system_timestep_after_hvac_reporting(state, self.end_system_timestep_callback)
+
+        # Act only on 15-min bucket boundaries (runs every SystemTimestep, but we gate it)
+        self.api.runtime.callback_begin_system_timestep_before_predictor(
+            state, self.begin_system_timestep_callback
+        )
+
+        # Reward accumulation (every SystemTimestep)
+        self.api.runtime.callback_end_system_timestep_after_hvac_reporting(
+            state, self.end_system_timestep_callback
+        )
 
     # ---- init / readiness ----
     def _try_init_handles(self, state):
@@ -516,273 +560,277 @@ class RLController:
         below = max(0.0, float(low) - float(temp_c))
         above = max(0.0, float(temp_c) - float(high))
         return below + above
+    
+    def _bucket_from_abs_minute(self, abs_minute: int) -> int:
+        # aligned 15-min buckets across the whole run
+        return int(abs_minute) // int(self.control_minutes)
 
-    # ---- callbacks ----
-    def begin_timestep_callback(self, state):
-        if not self._ensure_ready(state):
-            return
-
-        # 1) Current zone temps (controlled zones)
-        zone_temps: dict[str, float] = {}
-        for zone in self.ZONES:
-            h = self.room_temp_handles.get(zone, -1)
+    def _read_zone_temps(self, state) -> dict[str, float]:
+        d: dict[str, float] = {}
+        for z in self.ZONES:
+            h = self.room_temp_handles.get(z, -1)
             if h == -1:
-                zone_temps[zone] = float('nan')
+                d[z] = float("nan")
                 continue
             v = self.api.exchange.get_variable_value(state, h)
-            zone_temps[zone] = float(v) if v is not None else float('nan')
+            d[z] = float(v) if v is not None else float("nan")
+        return d
 
-        # 2) Outside air temp
-        outside_temp = self.api.exchange.get_variable_value(state, self.outside_temp_handle)
-        outside_temp = float(outside_temp) if outside_temp is not None else float('nan')
+    def _read_outside_temp(self, state) -> float:
+        v = self.api.exchange.get_variable_value(state, self.outside_temp_handle)
+        return float(v) if v is not None else float("nan")
 
-        # 3) Time
-        doy, mod, abs_minute = self._get_time_index(state)
-
-        # 4) Update shared history for trend features
-        avg_zone_temp = float(np.nanmean(list(zone_temps.values()))) if zone_temps else float('nan')
-        self._push_history(abs_minute, avg_zone_temp, outside_temp)
-
-        # 5) Build observation
-        obs, occupied = self._make_obs_multi_zone(zone_temps, outside_temp, doy, mod, abs_minute)
-
-        if self.step_count % 10 == 0:
-            print(f"[obs_debug] any_nonfinite={np.any(~np.isfinite(obs))}")
-
-        # 6) Finalize previous transition (reward computed in end_system_timestep_callback)
-        if self._prev_obs is not None and self._prev_act is not None and self._pending_rew is not None:
-            self.rollout_writer.append(
-                obs=self._prev_obs,
-                act=np.asarray(self._prev_act, dtype=np.float32),
-                rew=float(self._pending_rew),
-                next_obs=obs,
-                done=0.0,
-                day_of_year=self._prev_day_of_year,
-                minute_of_day=self._prev_minute_of_day,
-                energy_meter=self._pending_energy,
-            )
-            self._pending_rew = None
-            self._pending_energy = None
-
-        # 7) Policy action (normalized per zone)
-        a_pol = np.asarray(self.rl_model.get_action(obs), dtype=np.float32).reshape(-1)
-        print(f"[a_pol] shape={a_pol.shape} sample={a_pol[:min(5, a_pol.size)]}")
-
-        # If policy returns scalar, replicate across zones (explicit behavior)
-        if a_pol.size == 1:
-            a_pol = np.full((len(self.ZONES),), float(a_pol.item()), dtype=np.float32)
-
-        # Exploration noise (training rollouts)
-        explore_noise = float(os.environ.get("ANDRUIX_EXPLORE_NOISE", "0.0"))
-        a_raw = a_pol.copy()
-        if explore_noise > 0.0:
-            a_raw = a_raw + np.random.normal(0.0, explore_noise, size=len(self.ZONES)).astype(np.float32)
-
-        # Coerce/clamp to [-1, 1] and ensure correct length
-        a_norm = self._coerce_action_vec(a_raw, n=len(self.ZONES))
-
-        # Debug
-        print(
-            "[a_dbg]"
-            f" a_raw(shape={a_raw.shape}, dtype={a_raw.dtype})"
-            f" min={np.nanmin(a_raw):.4f} max={np.nanmax(a_raw):.4f} mean={np.nanmean(a_raw):.4f}"
-            f" any_nonfinite={np.any(~np.isfinite(a_raw))}"
-            f" sample={a_raw[:min(5, a_raw.size)]}"
-            " |"
-            f" a_norm(shape={a_norm.shape}, dtype={a_norm.dtype})"
-            f" min={np.nanmin(a_norm):.4f} max={np.nanmax(a_norm):.4f} mean={np.nanmean(a_norm):.4f}"
-            f" any_nonfinite={np.any(~np.isfinite(a_norm))}"
-            f" sample={a_norm[:min(5, a_norm.size)]}"
-            f" outside_temp={outside_temp:.4f}"
-        )
-
-        # --- Sanity: action saturation rate (how often actions hit bounds) ---
-        sat_thresh = 0.98
-        sat_frac = float(np.mean(np.abs(a_norm) >= sat_thresh))
-        if self.step_count % 20 == 0:  # adjust cadence as you like
-            print(f"[a_sat] frac(|a_norm|>={sat_thresh})={sat_frac:.2f}  a_norm={np.round(a_norm,3)}")
-
-        # Prepare dicts for timeseries logging
-        zone_actions_norm = {z: float(a_norm[i]) for i, z in enumerate(self.ZONES)}
-        zone_heat_sp = {}
-        zone_cool_sp = {}
-
-        # 8) Apply setpoints per zone
+    def _apply_action_vec(self, state, a_norm: np.ndarray, occupied: bool) -> None:
+        # Apply setpoints + update held setpoints for re-assertion
         for i, zone in enumerate(self.ZONES):
             heat_sp, cool_sp, center_sp = self._map_action_to_setpoints(float(a_norm[i]), occupied)
-
-            # Save for timeseries
-            zone_heat_sp[zone] = float(heat_sp)
-            zone_cool_sp[zone] = float(cool_sp)
 
             self.api.exchange.set_actuator_value(state, self.heat_sp_handles[zone], heat_sp)
             self.api.exchange.set_actuator_value(state, self.cool_sp_handles[zone], cool_sp)
 
-            # Track for slew penalty
+            self._held_heat_sp[zone] = float(heat_sp)
+            self._held_cool_sp[zone] = float(cool_sp)
+
+            # Track for slew (only changes when we apply a new action)
             self._last_heat_sp[zone] = heat_sp
             self._last_cool_sp[zone] = cool_sp
             if self._last_center_sp[zone] is not None:
                 self._prev_center_sp[zone] = self._last_center_sp[zone]
             self._last_center_sp[zone] = center_sp
 
-        # 9) Save state for next transition
+    def _select_action_vec(self, obs: np.ndarray) -> np.ndarray:
+        a_pol = np.asarray(self.rl_model.get_action(obs), dtype=np.float32).reshape(-1)
+        if a_pol.size == 1:
+            a_pol = np.full((len(self.ZONES),), float(a_pol.item()), dtype=np.float32)
+
+        explore_noise = float(os.environ.get("ANDRUIX_EXPLORE_NOISE", "0.0"))
+        a_raw = a_pol.copy()
+        if explore_noise > 0.0:
+            a_raw = a_raw + np.random.normal(0.0, explore_noise, size=len(self.ZONES)).astype(np.float32)
+
+        a_norm = self._coerce_action_vec(a_raw, n=len(self.ZONES))
+
+        # (optional) saturation log
+        if self.step_count % 10 == 0:
+            sat = float(np.mean(np.abs(a_norm) >= 0.98))
+            print(f"[a_ctl] step={self.step_count} sat_frac={sat:.2f} a_norm={np.round(a_norm,3)}")
+
+        return a_norm
+
+    def _write_bucket_timeseries(self, doy: int, mod: int, outside_temp: float, zone_temps: dict[str, float],
+                                reward_sum: float, energy_kwh_sum: float, occupied: bool) -> None:
+        # 1 row per control step (bucket)
+        self.ts_writer.append_step(
+            step_idx=int(self.step_count),
+            day_of_year=int(doy),
+            minute_of_day=int(mod),
+            outside_air_c=float(outside_temp),
+            hvac_energy_kwh=float(energy_kwh_sum),
+            reward=float(reward_sum),
+            zone_temps_c={k: float(v) for k, v in zone_temps.items()},
+            zone_setpoints_heat_c={z: float(self._held_heat_sp[z]) for z in self.ZONES if self._held_heat_sp[z] is not None},
+            zone_setpoints_cool_c={z: float(self._held_cool_sp[z]) for z in self.ZONES if self._held_cool_sp[z] is not None},
+            zone_actions_norm={z: float(self._held_act[i]) for i, z in enumerate(self.ZONES)},
+            extra_scalars={"occupied": 1.0 if occupied else 0.0},
+        )
+
+    # ---- callbacks ----
+    def begin_system_timestep_callback(self, state):
+        if not self._ensure_ready(state):
+            return
+
+        doy, mod, abs_minute = self._get_time_index(state)
+        if abs_minute is None or doy is None or mod is None:
+            return
+
+        zone_temps = self._read_zone_temps(state)
+        outside_temp = self._read_outside_temp(state)
+
+        # store last snapshot for finalize()
+        self._last_zone_temps = zone_temps
+        self._last_outside_temp = outside_temp
+        self._last_doy = doy
+        self._last_mod = mod
+
+        # push history once per *minute* (avoid duplicates from sub-minute system timesteps)
+        if self._last_hist_abs_minute != abs_minute:
+            avg_zone_temp = float(np.nanmean(list(zone_temps.values()))) if zone_temps else float("nan")
+            self._push_history(abs_minute, avg_zone_temp, outside_temp)
+            self._last_hist_abs_minute = abs_minute
+
+        obs, occupied = self._make_obs_multi_zone(zone_temps, outside_temp, doy, mod, abs_minute)
+        bucket_id = self._bucket_from_abs_minute(abs_minute)
+
+        # first ever bucket -> pick initial action
+        if self._bucket_id is None:
+            self._bucket_id = bucket_id
+            self._prev_obs = obs
+            self._prev_day_of_year = doy
+            self._prev_minute_of_day = mod
+
+            a_norm = self._select_action_vec(obs)
+            self._held_act = a_norm.astype(np.float32)
+            self._prev_act = self._held_act
+            self._apply_action_vec(state, self._held_act, occupied)
+            return
+
+        # same bucket -> just re-assert held setpoints (optional safety)
+        if bucket_id == self._bucket_id:
+            for z in self.ZONES:
+                if self._held_heat_sp[z] is not None:
+                    self.api.exchange.set_actuator_value(state, self.heat_sp_handles[z], float(self._held_heat_sp[z]))
+                if self._held_cool_sp[z] is not None:
+                    self.api.exchange.set_actuator_value(state, self.cool_sp_handles[z], float(self._held_cool_sp[z]))
+            return
+
+        # ---- bucket boundary crossed: finalize previous bucket, then choose/apply new action ----
+        energy_sum = float(self._bucket_energy_kwh_sum)
+        uncomfort_min = float(self._bucket_uncomfort_min)
+
+        energy_term_bucket = energy_sum / float(self.reward_scale)  # reward_scale is your energy scaling knob
+        comfort_term_bucket = self.uncomfort_min_weight * uncomfort_min
+
+        # if you also want hard-band minutes, you can add another counter similarly later
+        self._bucket_rew = -energy_term_bucket - comfort_term_bucket
+
+        print(
+            f"[bucket] doy={doy} min={mod} energy_kwh_sum={energy_sum:.3f} "
+            f"uncomfort_min={uncomfort_min:.1f} reward={self._bucket_rew:.3f} bucket_sys_steps={self._bucket_sys_steps}"
+        )
+
+        # write replay transition: (prev_obs, prev_act) -> obs with aggregated reward
+        if self._prev_obs is not None and self._prev_act is not None:
+            self.rollout_writer.append(
+                obs=self._prev_obs,
+                act=np.asarray(self._prev_act, dtype=np.float32),
+                rew=self._bucket_rew,
+                next_obs=obs,
+                done=0.0,
+                day_of_year=self._prev_day_of_year,
+                minute_of_day=self._prev_minute_of_day,
+                energy_meter=energy_sum,
+            )
+
+        # control-step index increments once per bucket
+        self.step_count += 1
+
+        # timeseries row for the bucket that just ended (uses boundary temps/time)
+        self._write_bucket_timeseries(doy, mod, outside_temp, zone_temps, self._bucket_rew, energy_sum, occupied)
+
+        # reset bucket accumulators
+        self._bucket_id = bucket_id
+        self._bucket_rew = 0.0
+        self._bucket_energy_kwh_sum = 0.0
+        self._bucket_sys_steps = 0
+        self._bucket_uncomfort_min = 0.0
+        self._bucket_last_mod = int(mod)
+        self._last_uncomfortable = False
+
+        # new action for new bucket
+        a_norm = self._select_action_vec(obs)
+        self._held_act = a_norm.astype(np.float32)
+        self._apply_action_vec(state, self._held_act, occupied)
+
+        # update “prev” for next transition
         self._prev_obs = obs
-        self._prev_act = a_norm
+        self._prev_act = self._held_act
         self._prev_day_of_year = doy
         self._prev_minute_of_day = mod
-
-        # Timeseries: stash begin-step info, flush in end_system_timestep_callback
-        self._ts_pending = {
-            "step_idx": int(self.step_count),          # aligns with reward/energy computed at end of this timestep
-            "day_of_year": doy,
-            "minute_of_day": mod,
-            "outside_air_c": float(outside_temp),
-            "zone_temps_c": {k: float(v) for k, v in zone_temps.items()},
-            "zone_setpoints_heat_c": zone_heat_sp,
-            "zone_setpoints_cool_c": zone_cool_sp,
-            "zone_actions_norm": zone_actions_norm,
-            "occupied": 1.0 if occupied else 0.0,      # optional scalar
-        }
 
     def end_system_timestep_callback(self, state):
         if not self._ensure_ready(state):
             return
+        if self._bucket_id is None:
+            return  # control loop hasn’t initialized yet
 
-        # 1. Get current zone temperatures (dict: zone → temp)
-        zone_temps = {}
-        for zone in self.ZONES:
-            handle = self.room_temp_handles.get(zone, -1)
-            if handle == -1:
-                continue
-            temp = self.api.exchange.get_variable_value(state, handle)
-            zone_temps[zone] = temp if temp is not None else np.nan
+        self.sys_step_count += 1
 
-        # 2. Confirm setpoints per zone (for debug)
-        confirmed_setpoints = {}
-        for zone in self.ZONES:
-            h_handle = self.heat_sp_handles.get(zone, -1)
-            c_handle = self.cool_sp_handles.get(zone, -1)
-            if h_handle != -1 and c_handle != -1:
-                confirmed_heat = self.api.exchange.get_actuator_value(state, h_handle)
-                confirmed_cool = self.api.exchange.get_actuator_value(state, c_handle)
-                confirmed_setpoints[zone] = (confirmed_heat, confirmed_cool)
+        doy, mod, abs_minute = self._get_time_index(state)
+        zone_temps = self._read_zone_temps(state)
+        outside_temp = self._read_outside_temp(state)
 
-        # Optional: log confirmed setpoints (every 10 steps)
-        if self.step_count % 10 == 0:
-            for zone, (h, c) in confirmed_setpoints.items():
-                print(f"[verify_end] Zone {zone}: heat_confirmed={h:.2f}, cool_confirmed={c:.2f}")
-
-        # 3. Outside temp (shared)
-        outside_temp = self.api.exchange.get_variable_value(state, self.outside_temp_handle)
-
-        # 4. Meter reading (shared — facility or HVAC)
         raw_val = self.api.exchange.get_meter_value(state, self.facility_elec_meter_handle)
         if raw_val == 0.0 and self.api.exchange.api_error_flag(state):
             print("[meter] api_error_flag=True reading meter; handle likely invalid")
             return
 
-        # Raw timestep meter value (J) -> kWh (if reward_scale=3.6e6)
+        # EnergyPlus meter is Joules over the *system timestep*
         energy_kwh = float(raw_val) / 3_600_000.0
+        self._bucket_energy_kwh_sum += float(energy_kwh)
 
-        energy_term = energy_kwh / self.reward_scale
-
-        # 5. Comfort & hard penalties — per-zone, then average
-        comfort_pen = 0.0
-        hard_pen = 0.0
-        num_valid_zones = 0
-
-        occupied = self._is_occupied(self._prev_minute_of_day)  # assuming shared occupancy
+        occupied = self._is_occupied(mod)
+        uncomfortable_now = False
 
         if occupied and (self.comfort_weight > 0.0 or self.hard_weight > 0.0):
-            for zone, temp_now in zone_temps.items():
-                if np.isnan(temp_now):
+            for _, t in zone_temps.items():
+                if np.isnan(t):
                     continue
-                num_valid_zones += 1
 
-                # Comfort penalty (squared violation)
-                if self.comfort_weight > 0.0:
-                    v = self._temp_violation(temp_now, self.comfort_low, self.comfort_high)
-                    comfort_pen += self.comfort_weight * (v * v)
+                v_comf = self._temp_violation(t, self.comfort_low, self.comfort_high)
+                if v_comf > 0.0:
+                    uncomfortable_now = True
 
-                # Hard penalty
-                if self.hard_weight > 0.0:
-                    v = self._temp_violation(temp_now, self.hard_low, self.hard_high)
-                    hard_pen += self.hard_weight * (v * v)
 
-            # Average (normalize by num zones to keep scale consistent)
-            if num_valid_zones > 0:
-                comfort_pen /= num_valid_zones
-                hard_pen /= num_valid_zones
+        # 3) only increment minutes when minute-of-day advances
+        # add the *previous* minute's uncomfortable state into the bucket
+        if self._bucket_last_mod is None:
+            self._bucket_last_mod = int(mod)
+            self._last_uncomfortable = bool(uncomfortable_now)
+            self._last_occupied = bool(occupied)
+        else:
+            mod_i = int(mod)
+            prev_mod = int(self._bucket_last_mod)
 
-        # 6. Slew penalty — per-zone, then average
-        slew_pen = 0.0
-        if self.slew_weight > 0.0:
-            slew_sum = 0.0
-            for zone in self.ZONES:
-                prev = self._prev_center_sp.get(zone)
-                last = self._last_center_sp.get(zone)
-                if prev is not None and last is not None:
-                    d = float(last) - float(prev)
-                    slew_sum += self.slew_weight * (d * d)
-            # Average
-            slew_pen = slew_sum / max(1, len(self.ZONES))
+            if mod_i != prev_mod:
+                # handle minute wrap-around at midnight
+                delta_min = mod_i - prev_mod
+                if delta_min < 0:
+                    delta_min += 1440
 
-        # 7. Total reward
-        rew = -energy_term - comfort_pen - hard_pen - slew_pen
+                if self._last_uncomfortable and self._last_occupied:
+                    self._bucket_uncomfort_min += float(delta_min)
 
-        # 8. Step count & debug print (updated for multi-zone summary)
-        self.step_count += 1
-        if self.debug_meter_every_n_steps and (self.step_count % self.debug_meter_every_n_steps == 0):
-            meter_str = f"raw={raw_val:.2f}"
-            avg_tz = np.nanmean(list(zone_temps.values())) if zone_temps else np.nan
+                self._bucket_last_mod = mod_i
+                self._last_uncomfortable = bool(uncomfortable_now)
+                self._last_occupied = bool(occupied)
+
+        # accumulate into current 15-min bucket
+        self._bucket_sys_steps += 1
+
+        if self.debug_meter_every_n_steps and (self.sys_step_count % self.debug_meter_every_n_steps == 0):
+            avg_tz = float(np.nanmean(list(zone_temps.values()))) if zone_temps else float("nan")
             print(
-                f"[step {self.step_count}] dayofyr={self._prev_day_of_year} min={self._prev_minute_of_day} {meter_str} kWh={energy_kwh:.4f} energy term={energy_term:.4f}"
-                f"avg_Tz={avg_tz:.2f}C occ={occupied} outside_temp={outside_temp:.2f}"
-                f"pen(c={comfort_pen:.3f}, h={hard_pen:.3f}, s={slew_pen:.3f}) rew={rew:.4f}"
+                f"[sys {self.sys_step_count}] dayofyr={doy} min={mod} raw={raw_val:.2f} "
+                f"kWh={energy_kwh:.4f} avg_Tz={avg_tz:.2f}C "
+                f"occ={occupied} outside_temp={outside_temp:.2f} bucket_energy_kwh_sum={self._bucket_energy_kwh_sum:.4f} "
+                f"bucket={self._bucket_id} bucket_rew_sum={self._bucket_rew:.2f}"
             )
-
-        # 9. Store for rollout
-        self._pending_rew = rew
-        self._pending_energy = energy_kwh
-
-                # Timeseries: flush the pending row now that energy + reward are known
-        if self._ts_pending is not None:
-            p = self._ts_pending
-            self.ts_writer.append_step(
-                step_idx=p["step_idx"],
-                day_of_year=p["day_of_year"],
-                minute_of_day=p["minute_of_day"],
-                outside_air_c=p["outside_air_c"],
-                hvac_energy_kwh=float(energy_kwh),
-                reward=float(rew),
-                zone_temps_c=p["zone_temps_c"],
-                zone_setpoints_heat_c=p["zone_setpoints_heat_c"],
-                zone_setpoints_cool_c=p["zone_setpoints_cool_c"],
-                zone_actions_norm=p["zone_actions_norm"],
-                extra_scalars={
-                    "occupied": float(p.get("occupied", 1.0)),
-                    # easy future adds:
-                    # "comfort_pen": float(comfort_pen),
-                    # "hard_pen": float(hard_pen),
-                    # "slew_pen": float(slew_pen),
-                },
-            )
-            self._ts_pending = None
 
     def finalize_and_write_rollout(self):
-        if self._prev_obs is not None and self._prev_act is not None and self._pending_rew is not None:
+        # flush the final (possibly partial) bucket
+        if self._prev_obs is not None and self._prev_act is not None and self._bucket_id is not None:
             self.rollout_writer.append(
                 obs=self._prev_obs,
                 act=np.asarray(self._prev_act, dtype=np.float32),
-                rew=float(self._pending_rew),
+                rew=float(self._bucket_rew),
                 next_obs=self._prev_obs,
                 done=1.0,
                 day_of_year=self._prev_day_of_year,
                 minute_of_day=self._prev_minute_of_day,
-                energy_meter=self._pending_energy,
+                energy_meter=float(self._bucket_energy_kwh_sum),
             )
-            self._pending_rew = None
-            self._pending_energy = None
+
+            # optional: write final timeseries row too (if we have last snapshot)
+            if self._last_doy is not None and self._last_mod is not None and self._last_zone_temps is not None:
+                occ = self._is_occupied(self._last_mod)
+                self._write_bucket_timeseries(
+                    self._last_doy, self._last_mod,
+                    float(self._last_outside_temp if self._last_outside_temp is not None else float("nan")),
+                    self._last_zone_temps,
+                    float(self._bucket_rew),
+                    float(self._bucket_energy_kwh_sum),
+                    occ
+                )
 
         out_npz = self.rollout_writer.write()
         print(f"[rollout] wrote {out_npz}")
@@ -836,6 +884,8 @@ def parse_args():
     p.add_argument("--min-heat-sp", type=float, default=float(os.environ.get("ANDRUIX_MIN_HEAT_SP", "15.0")))
     p.add_argument("--max-cool-sp", type=float, default=float(os.environ.get("ANDRUIX_MAX_COOL_SP", "30.0")))
     p.add_argument("--min-deadband", type=float, default=float(os.environ.get("ANDRUIX_MIN_DEADBAND", "0.5")))
+    p.add_argument("--control-minutes", type=int, default=int(os.environ.get("ANDRUIX_CONTROL_MINUTES", "15")),
+)
     return p.parse_args()
 
 
@@ -899,6 +949,7 @@ def main():
         min_heat_sp=args.min_heat_sp,
         max_cool_sp=args.max_cool_sp,
         min_deadband=args.min_deadband,
+        control_minutes=args.control_minutes,
     )
 
     eplus_args = ["-w", str(epw), "-d", str(outdir), str(idf)]
