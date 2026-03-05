@@ -49,7 +49,7 @@ class RLController:
         energy_meter_name: str = "Electricity:Building",
         dump_api_available_csv: bool = True,
         debug_meter_every_n_steps: int = 20,
-        reward_scale: float = 3.6e6,
+        reward_scale: float = 1,
 
         # --- Observation features ---
         include_occ_flag: bool = True,
@@ -807,30 +807,85 @@ class RLController:
             )
 
     def finalize_and_write_rollout(self):
-        # flush the final (possibly partial) bucket
-        if self._prev_obs is not None and self._prev_act is not None and self._bucket_id is not None:
-            self.rollout_writer.append(
-                obs=self._prev_obs,
-                act=np.asarray(self._prev_act, dtype=np.float32),
-                rew=float(self._bucket_rew),
-                next_obs=self._prev_obs,
-                done=1.0,
-                day_of_year=self._prev_day_of_year,
-                minute_of_day=self._prev_minute_of_day,
-                energy_meter=float(self._bucket_energy_kwh_sum),
-            )
+        """
+        Flush the final (possibly partial) bucket.
 
-            # optional: write final timeseries row too (if we have last snapshot)
-            if self._last_doy is not None and self._last_mod is not None and self._last_zone_temps is not None:
-                occ = self._is_occupied(self._last_mod)
-                self._write_bucket_timeseries(
-                    self._last_doy, self._last_mod,
-                    float(self._last_outside_temp if self._last_outside_temp is not None else float("nan")),
-                    self._last_zone_temps,
-                    float(self._bucket_rew),
-                    float(self._bucket_energy_kwh_sum),
-                    occ
+        We treat end-of-window as a truncation (done=0.0) by default so TD3 still bootstraps.
+        If you ever want a true terminal episode, set ANDRUIX_TERMINAL_END=1.
+        """
+        terminal_end = (os.environ.get("ANDRUIX_TERMINAL_END", "0") == "1")
+
+        # Only flush if we actually have an (obs, act) to close out
+        if self._prev_obs is not None and self._prev_act is not None and self._bucket_id is not None:
+            # If we never accumulated anything since the last boundary, don't emit a fake final step
+            if int(self._bucket_sys_steps) > 0:
+                energy_sum = float(self._bucket_energy_kwh_sum)
+                uncomfort_min = float(self._bucket_uncomfort_min)
+
+                energy_term_bucket = energy_sum / float(self.reward_scale)
+                comfort_term_bucket = float(self.uncomfort_min_weight) * uncomfort_min
+                final_rew = -energy_term_bucket - comfort_term_bucket
+
+                # Build an end observation from the last snapshot (preferred)
+                obs_end = self._prev_obs
+                end_doy = self._prev_day_of_year if self._prev_day_of_year is not None else -1
+                end_mod = self._prev_minute_of_day if self._prev_minute_of_day is not None else -1
+                occ_end = self._is_occupied(end_mod if end_mod >= 0 else None)
+
+                if (
+                    self._last_zone_temps is not None
+                    and self._last_outside_temp is not None
+                    and self._last_doy is not None
+                    and self._last_mod is not None
+                ):
+                    end_doy = int(self._last_doy)
+                    end_mod = int(self._last_mod)
+                    # abs_minute consistent with _get_time_index()
+                    mod_clamped = max(0, min(1439, end_mod))
+                    abs_minute = (max(1, end_doy) - 1) * 1440 + mod_clamped
+
+                    obs_end, occ_end = self._make_obs_multi_zone(
+                        self._last_zone_temps,
+                        float(self._last_outside_temp),
+                        end_doy,
+                        mod_clamped,
+                        abs_minute,
+                    )
+
+                done_final = 1.0 if terminal_end else 0.0
+
+                print(
+                    f"[bucket-final] doy={end_doy} min={end_mod} energy_kwh_sum={energy_sum:.3f} "
+                    f"uncomfort_min={uncomfort_min:.1f} reward={final_rew:.3f} bucket_sys_steps={self._bucket_sys_steps} "
+                    f"done={done_final:.1f}"
                 )
+
+                # Write final replay transition for the last held action
+                self.rollout_writer.append(
+                    obs=self._prev_obs,
+                    act=np.asarray(self._prev_act, dtype=np.float32),
+                    rew=float(final_rew),
+                    next_obs=obs_end,
+                    done=float(done_final),
+                    day_of_year=self._prev_day_of_year,
+                    minute_of_day=self._prev_minute_of_day,
+                    energy_meter=float(energy_sum),
+                )
+
+                # Mirror the boundary behavior: this was a completed control step
+                self.step_count += 1
+
+                # Final timeseries row (use last snapshot if available)
+                if self._last_zone_temps is not None and self._last_outside_temp is not None and end_doy != -1 and end_mod != -1:
+                    self._write_bucket_timeseries(
+                        int(end_doy),
+                        int(end_mod),
+                        float(self._last_outside_temp),
+                        self._last_zone_temps,
+                        float(final_rew),
+                        float(energy_sum),
+                        bool(occ_end),
+                    )
 
         out_npz = self.rollout_writer.write()
         print(f"[rollout] wrote {out_npz}")
@@ -855,7 +910,7 @@ def parse_args():
 
     p.add_argument("--policy-kind", default=os.environ.get("ANDRUIX_POLICY_KIND", "torch"), choices=["simple", "torch"])
     p.add_argument("--policy-path", default=os.environ.get("ANDRUIX_POLICY_PATH", os.environ.get("POLICY_PATH", "")))
-    p.add_argument("--reward-scale", type=float, default=float(os.environ.get("ANDRUIX_REWARD_SCALE", "1000000.0")))
+    p.add_argument("--reward-scale", type=float, default=float(os.environ.get("ANDRUIX_REWARD_SCALE", "1")))
 
     # Observation feature toggles
     p.add_argument("--include-occ-flag", action="store_true", default=os.environ.get("ANDRUIX_OBS_OCC", "1") == "1")

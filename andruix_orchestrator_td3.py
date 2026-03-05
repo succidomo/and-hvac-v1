@@ -47,6 +47,9 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+from datetime import date, timedelta
+
+import random
 
 import numpy as np
 
@@ -88,6 +91,20 @@ def atomic_save_torch(obj: Dict, out_path: Path) -> None:
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     torch.save(obj, tmp_path)
     os.replace(tmp_path, out_path)  # atomic on same filesystem
+
+def mmdd_to_date(mmdd: str, year: int = 2001) -> date:
+    m, d = map(int, mmdd.split("/"))
+    return date(year, m, d)
+
+def date_to_mmdd(dt: date) -> str:
+    return dt.strftime("%m/%d")
+
+def normalize_range(start_mmdd: str, end_mmdd: str, year: int = 2001) -> tuple[date, date]:
+    s = mmdd_to_date(start_mmdd, year)
+    e = mmdd_to_date(end_mmdd, year)
+    if e < s:
+        e = date(year + 1, e.month, e.day)  # supports wrap-around ranges
+    return s, e
 
 
 # -----------------------------
@@ -206,7 +223,7 @@ class Critic(nn.Module):
 
 @dataclass
 class TD3Config:
-    gamma: float = 0.99
+    gamma: float = 0.98
     tau: float = 0.005
     policy_noise: float = 0.2
     noise_clip: float = 0.5
@@ -248,7 +265,16 @@ class TD3Learner:
         return a
 
     def update(self, rb: ReplayBuffer, steps: int) -> Dict[str, float]:
-        metrics = {"q_loss": 0.0, "actor_loss": 0.0}
+        metrics = {
+            "q_loss": 0.0,
+            "actor_loss": 0.0,
+            # Critic/target diagnostics (useful for reward scaling + stability debugging)
+            "target_mean": 0.0,
+            "target_std": 0.0,
+            "q1_mean": 0.0,
+            "q2_mean": 0.0,
+            "td_error_abs_mean": 0.0,
+        }
         if steps <= 0:
             return metrics
 
@@ -256,24 +282,43 @@ class TD3Learner:
             obs, act, rew, next_obs, done = rb.sample(self.cfg.batch_size, self.device)
 
             with torch.no_grad():
-                noise = (torch.randn_like(act) * self.cfg.policy_noise).clamp(-self.cfg.noise_clip, self.cfg.noise_clip)
-                next_act = (self.actor_targ(next_obs) + noise).clamp(-self.cfg.act_limit, self.cfg.act_limit)
+                noise = (torch.randn_like(act) * self.cfg.policy_noise).clamp(
+                    -self.cfg.noise_clip, self.cfg.noise_clip
+                )
+                next_act = (self.actor_targ(next_obs) + noise).clamp(
+                    -self.cfg.act_limit, self.cfg.act_limit
+                )
 
                 q1_t = self.q1_targ(next_obs, next_act)
                 q2_t = self.q2_targ(next_obs, next_act)
                 q_t = torch.min(q1_t, q2_t)
                 target = rew + self.cfg.gamma * (1.0 - done) * q_t
 
+                # Target statistics (for debugging reward scaling / bootstrapping)
+                metrics["target_mean"] += float(target.mean().item())
+                metrics["target_std"] += float(target.std(unbiased=False).item())
+
             q1 = self.q1(obs, act)
             q2 = self.q2(obs, act)
-            q_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
+            q_loss = F.smooth_l1_loss(q1, target) + F.smooth_l1_loss(q2, target)
+
+            # Critic statistics + TD error magnitude (for diagnosing critic blowups)
+            with torch.no_grad():
+                q1_det = q1.detach()
+                q2_det = q2.detach()
+                metrics["q1_mean"] += float(q1_det.mean().item())
+                metrics["q2_mean"] += float(q2_det.mean().item())
+                td_err_abs = 0.5 * (
+                    (target - q1_det).abs().mean() + (target - q2_det).abs().mean()
+                )
+                metrics["td_error_abs_mean"] += float(td_err_abs.item())
 
             self.q_opt.zero_grad(set_to_none=True)
             q_loss.backward()
 
             torch.nn.utils.clip_grad_norm_(
                 list(self.q1.parameters()) + list(self.q2.parameters()),
-                max_norm=0.5
+                max_norm=1.0
             )
 
             self.q_opt.step()
@@ -297,8 +342,10 @@ class TD3Learner:
             metrics["q_loss"] += float(q_loss.detach().cpu().item())
             metrics["actor_loss"] += float(actor_loss.detach().cpu().item())
 
-        metrics["q_loss"] /= steps
-        metrics["actor_loss"] /= steps
+        # Average across gradient steps
+        for k in list(metrics.keys()):
+            metrics[k] /= steps
+
         return metrics
 
     def _soft_update(self, net: nn.Module, targ: nn.Module):
@@ -330,8 +377,10 @@ class WorkerSpec:
     rollout_days: int
     seed: int
     extra_env: Dict[str, str]
+    start_mmdd: str
+    end_mmdd: str
     cpus: Optional[float] = None
-    mem: Optional[str] = None  # e.g. "8g"
+    mem: Optional[str] = None
 
 
 def docker_run_worker(spec: WorkerSpec) -> str:
@@ -350,8 +399,12 @@ def docker_run_worker(spec: WorkerSpec) -> str:
 
     extra = spec.extra_env or {}
     zones = extra.get("EPLUS_ZONE")
-    start = extra.get("EPLUS_START_MMDD")
-    end   = extra.get("EPLUS_END_MMDD")
+    start = spec.start_mmdd
+    end   = spec.end_mmdd
+
+    env["EPLUS_START_MMDD"] = start
+    env["EPLUS_END_MMDD"]   = end
+    
     if not zones:
         raise ValueError("EPLUS_ZONE must be provided (comma-separated zone list).")
     if not start or not end:
@@ -377,7 +430,7 @@ def docker_run_worker(spec: WorkerSpec) -> str:
         "--start-date", start,
         "--end-date", end,
         "--policy-kind", extra.get("ANDRUIX_POLICY_KIND", "torch"),
-        "--reward-scale", extra.get("ANDRUIX_REWARD_SCALE", "3600000"),
+        "--reward-scale", extra.get("ANDRUIX_REWARD_SCALE", "1"),
         "--comfort-weight", "1.0",
         "--slew-weight", "0.01",
         "--energy-meter", "Electricity:HVAC",
@@ -513,6 +566,11 @@ class Orchestrator:
         self.tb_run_name = tb_run_name or f"run-{int(time.time())}"
         self.act_dim = act_dim
         self.obs_dim = obs_dim
+        self.season_start_mmdd = self.extra_env["EPLUS_START_MMDD"]
+        self.season_end_mmdd   = self.extra_env["EPLUS_END_MMDD"]
+        self.season_start_date, self.season_end_date = normalize_range(
+            self.season_start_mmdd, self.season_end_mmdd
+        )
 
 
         self.blob_client = None
@@ -603,10 +661,25 @@ class Orchestrator:
             json.dump(meta, f, indent=2)
         os.replace(self.paths["policy_dir"] / "policy_meta.json.tmp", self.paths["policy_dir"] / "policy_meta.json")
 
+    def pick_window(self, seed: int) -> tuple[str, str]:
+        s, e = self.season_start_date, self.season_end_date
+        total_days = (e - s).days + 1
+        span = int(self.rollout_days)
+
+        if total_days <= span:
+            return date_to_mmdd(s), date_to_mmdd(e)
+
+        rng = random.Random(seed)
+        offset = rng.randint(0, total_days - span)
+        w_start = s + timedelta(days=offset)
+        w_end   = w_start + timedelta(days=span - 1)  # inclusive
+        return date_to_mmdd(w_start), date_to_mmdd(w_end)
+
     def launch_more_workers_if_needed(self) -> None:
         while len(self.active) < self.max_workers and not self._stop:
             rollout_id = uuid.uuid4().hex[:12]
             seed = int.from_bytes(os.urandom(4), "little", signed=False)
+            start_mmdd, end_mmdd = self.pick_window(seed)
 
             spec = WorkerSpec(
                 image=self.image,
@@ -615,9 +688,12 @@ class Orchestrator:
                 rollout_days=self.rollout_days,
                 seed=seed,
                 extra_env=self.extra_env,
+                start_mmdd=start_mmdd,
+                end_mmdd=end_mmdd,
                 cpus=self.worker_cpus,
                 mem=self.worker_mem,
             )
+
             cid = docker_run_worker(spec)
             self.active[rollout_id] = cid
             print(f"[orchestrator] launched rollout {rollout_id} -> container {cid}")
@@ -830,6 +906,11 @@ class Orchestrator:
         if self.writer is not None:
             self.writer.add_scalar('train/q_loss', metrics['q_loss'], self.learner.total_updates)
             self.writer.add_scalar('train/actor_loss', metrics['actor_loss'], self.learner.total_updates)
+            self.writer.add_scalar('train/target_mean', metrics.get('target_mean', 0.0), self.learner.total_updates)
+            self.writer.add_scalar('train/target_std', metrics.get('target_std', 0.0), self.learner.total_updates)
+            self.writer.add_scalar('train/q1_mean', metrics.get('q1_mean', 0.0), self.learner.total_updates)
+            self.writer.add_scalar('train/q2_mean', metrics.get('q2_mean', 0.0), self.learner.total_updates)
+            self.writer.add_scalar('train/td_error_abs_mean', metrics.get('td_error_abs_mean', 0.0), self.learner.total_updates)
             self.writer.add_scalar('train/steps_this_update', int(steps), self.learner.total_updates)
 
         if self.publish_every_rollouts > 0 and (self.rollouts_ingested % self.publish_every_rollouts == 0):
@@ -930,7 +1011,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--worker-mem", type=str, default=None)
 
     # TD3 knobs (starter defaults)
-    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--gamma", type=float, default=0.98)
     p.add_argument("--tau", type=float, default=0.005)
     p.add_argument("--policy-noise", type=float, default=0.1)
     p.add_argument("--noise-clip", type=float, default=0.5)
