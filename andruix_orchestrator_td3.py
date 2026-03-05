@@ -404,7 +404,7 @@ def docker_run_worker(spec: WorkerSpec) -> str:
 
     env["EPLUS_START_MMDD"] = start
     env["EPLUS_END_MMDD"]   = end
-    
+
     if not zones:
         raise ValueError("EPLUS_ZONE must be provided (comma-separated zone list).")
     if not start or not end:
@@ -437,6 +437,8 @@ def docker_run_worker(spec: WorkerSpec) -> str:
         "--zones", zones,
         "--policy-path", "/shared/policy/latest/policy.pt",
     ]
+
+    print(f"[orchestrator] rollout_id={spec.rollout_id} window={start}->{end} days={spec.rollout_days}")
 
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
