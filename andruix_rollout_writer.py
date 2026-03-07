@@ -86,6 +86,7 @@ class RolloutWriter:
         self.day_of_year: list[np.int32] = []
         self.minute_of_day: list[np.int32] = []
         self.energy_meter: list[np.float32] = []
+        self.outside_air_c: list[np.float32] = []
 
     def append(
         self,
@@ -98,6 +99,7 @@ class RolloutWriter:
         day_of_year: int | None = None,
         minute_of_day: int | None = None,
         energy_meter: float | None = None,
+        outside_air_c: float | None = None,
     ) -> None:
         """Append one transition.
 
@@ -124,6 +126,7 @@ class RolloutWriter:
         self.day_of_year.append(np.int32(-1 if day_of_year is None else int(day_of_year)))
         self.minute_of_day.append(np.int32(-1 if minute_of_day is None else int(minute_of_day)))
         self.energy_meter.append(np.float32(np.nan if energy_meter is None else float(energy_meter)))
+        self.outside_air_c.append(np.float32(np.nan if outside_air_c is None else float(outside_air_c)))
 
 
     def to_npz_dict(self) -> dict[str, np.ndarray]:
@@ -150,6 +153,7 @@ class RolloutWriter:
             "day_of_year": np.asarray(self.day_of_year, np.int32),
             "minute_of_day": np.asarray(self.minute_of_day, np.int32),
             "energy_meter": np.asarray(self.energy_meter, np.float32),
+            "outside_air_c": np.asarray(self.outside_air_c, np.float32),
             }
 
     def write(self) -> Path:

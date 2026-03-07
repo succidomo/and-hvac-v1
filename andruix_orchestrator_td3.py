@@ -393,7 +393,9 @@ def docker_run_worker(spec: WorkerSpec) -> str:
         "ANDRUIX_SEED": str(spec.seed),
         "ANDRUIX_POLICY_PATH": "/shared/policy/latest/policy.pt",
         "ROLLOUT_DIR": f"/shared/rollouts/inbox/{spec.rollout_id}",
-        "ANDRUIX_UNCOMFORT_MIN_WEIGHT": "0.5",
+        "ANDRUIX_UNCOMFORT_MIN_WEIGHT": "0.1",
+        "ANDRUIX_SP_CENTER_MAX_OCC": "27",
+        "ANDRUIX_DEADBAND_OCC": "2.0",
     }
     env.update(spec.extra_env or {})
 
@@ -516,7 +518,8 @@ def load_traj_npz(traj_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
         next_obs = data["next_obs"]
         done = data["done"]
         energy_meter = data["energy_meter"]
-    return obs, act, rew, next_obs, done, energy_meter
+        outside_air_c = data["outside_air_c"]
+    return obs, act, rew, next_obs, done, energy_meter, outside_air_c
 
 def load_traj_extras_npz(traj_path: Path) -> Dict[str, Any]:
     with np.load(traj_path) as data:
@@ -800,7 +803,7 @@ class Orchestrator:
                 continue
 
             try:
-                obs, act, rew, next_obs, done, energy_meter = load_traj_npz(npz_path)
+                obs, act, rew, next_obs, done, energy_meter, outside_air_c  = load_traj_npz(npz_path)
                 meta = load_rollout_meta_for_npz(npz_path)
                 zones = meta.get("zones") or []
 
@@ -869,7 +872,20 @@ class Orchestrator:
                 # TensorBoard rollout metrics
                 if self.writer is not None:
                     ep_return = float(np.sum(rew))
-                    energy_arr = np.asarray(energy_meter, dtype=np.float32) 
+                    energy_arr = np.asarray(energy_meter, dtype=np.float32)
+                    oat_arr = np.asarray(outside_air_c, dtype=np.float32)
+
+                    oat_base_c = float(self.extra_env.get("ANDRUIX_OAT_BASE_C", "18.0"))
+                    eps = 1e-6
+
+                    cooling_deg_c = np.maximum(oat_arr - oat_base_c, 0.0)
+                    cooling_deg_c_sum = float(np.sum(cooling_deg_c))
+
+                    kwh_sum = float(np.sum(energy_arr))
+                    kwh_per_cooling_deg_c = kwh_sum / max(cooling_deg_c_sum, eps)
+
+                    mean_oat_c = float(np.mean(oat_arr))
+
                     self.writer.add_scalar('rollout/transitions', int(added), self.rollouts_ingested)
                     self.writer.add_scalar('rollout/episode_return', ep_return, self.rollouts_ingested)
                     self.writer.add_scalar('rollout/mean_reward', float(np.mean(rew)), self.rollouts_ingested)
@@ -877,6 +893,9 @@ class Orchestrator:
                     self.writer.add_scalar('rollout/max_reward', float(np.max(rew)), self.rollouts_ingested)
                     self.writer.add_scalar('rollout/energy_kwh_sum', float(np.sum(energy_arr)), self.rollouts_ingested)
                     self.writer.add_scalar('rollout/energy_kwh_mean', float(np.mean(energy_arr)), self.rollouts_ingested)
+                    self.writer.add_scalar('rollout/oat_mean_c', mean_oat_c, self.rollouts_ingested)
+                    self.writer.add_scalar('rollout/cooling_deg_c_sum', cooling_deg_c_sum, self.rollouts_ingested)
+                    self.writer.add_scalar('rollout/kwh_per_cooling_deg_c', kwh_per_cooling_deg_c, self.rollouts_ingested)
                     self.writer.add_scalar('buffer/size', int(self.rb.size), self.rollouts_ingested)
             except Exception as e:
                 print(f"[orchestrator] ERROR ingesting {rdir}: {e}")

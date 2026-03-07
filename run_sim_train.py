@@ -69,7 +69,7 @@ class RLController:
 
         # --- Reward shaping: comfort + hard constraints ---
         comfort_low: float = 21.0,
-        comfort_high: float = 24.0,
+        comfort_high: float = 25.0,
         comfort_weight: float = 0.1,
         hard_low: float = 15.0,
         hard_high: float = 30.0,
@@ -709,6 +709,7 @@ class RLController:
                 day_of_year=self._prev_day_of_year,
                 minute_of_day=self._prev_minute_of_day,
                 energy_meter=energy_sum,
+                outside_air_c=float(outside_temp),
             )
 
         # control-step index increments once per bucket
@@ -870,6 +871,7 @@ class RLController:
                     day_of_year=self._prev_day_of_year,
                     minute_of_day=self._prev_minute_of_day,
                     energy_meter=float(energy_sum),
+                    outside_air_c=float(self._last_outside_temp),
                 )
 
                 # Mirror the boundary behavior: this was a completed control step
@@ -978,7 +980,7 @@ def main():
         policy_path=args.policy_path,
         policy_kind=args.policy_kind,
         dump_api_available_csv=args.dump_api_csv,
-        debug_meter_every_n_steps=1,
+        debug_meter_every_n_steps=20,
         reward_scale=args.reward_scale,
 
         include_occ_flag=bool(args.include_occ_flag),
