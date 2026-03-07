@@ -886,6 +886,8 @@ class Orchestrator:
 
                     mean_oat_c = float(np.mean(oat_arr))
 
+                    kwh_per_mean_oat_c = kwh_sum / max(mean_oat_c, eps)
+
                     self.writer.add_scalar('rollout/transitions', int(added), self.rollouts_ingested)
                     self.writer.add_scalar('rollout/episode_return', ep_return, self.rollouts_ingested)
                     self.writer.add_scalar('rollout/mean_reward', float(np.mean(rew)), self.rollouts_ingested)
@@ -893,7 +895,7 @@ class Orchestrator:
                     self.writer.add_scalar('rollout/max_reward', float(np.max(rew)), self.rollouts_ingested)
                     self.writer.add_scalar('rollout/energy_kwh_sum', float(np.sum(energy_arr)), self.rollouts_ingested)
                     self.writer.add_scalar('rollout/energy_kwh_mean', float(np.mean(energy_arr)), self.rollouts_ingested)
-                    self.writer.add_scalar('rollout/oat_mean_c', mean_oat_c, self.rollouts_ingested)
+                    self.writer.add_scalar('rollout/kwh_per_mean_oat_c', kwh_per_mean_oat_c, self.rollouts_ingested)
                     self.writer.add_scalar('rollout/cooling_deg_c_sum', cooling_deg_c_sum, self.rollouts_ingested)
                     self.writer.add_scalar('rollout/kwh_per_cooling_deg_c', kwh_per_cooling_deg_c, self.rollouts_ingested)
                     self.writer.add_scalar('buffer/size', int(self.rb.size), self.rollouts_ingested)

@@ -64,28 +64,35 @@ python3 andruix_orchestrator_td3.py \
   --image andruix/eplus:latest \
   --obs-dim 15 \
   --act-dim 5 \
-  --max-workers 1 \
-  --rollout-days 2 \
+  --max-workers 3 \
+  --rollout-days 7 \
   --batch-size 256 \
   --min-replay-before-train 10000 \
   --train-steps-per-rollout 500 \
   --publish-every-rollouts 1 \
+  --gamma 0.98 \
   --actor-lr 1e-4 \
-  --critic-lr 7e-5 \
-  --policy-noise .4 \
-  --tb-run-name denver_july15_mz_1_2 \
+  --critic-lr 1e-4 \
+  --policy-noise .2 \
+  --tb-run-name denver_july15_mz_1_3_5 \
   --env EPLUS_START_MMDD=07/15 \
   --env EPLUS_END_MMDD=09/22 \
   --env "EPLUS_ZONE=PERIMETER_BOT_ZN_1,PERIMETER_BOT_ZN_2,PERIMETER_BOT_ZN_3,PERIMETER_BOT_ZN_4,CORE_BOTTOM" \
   --env "ANDRUIX_POLICY_KIND=torch" \
   --env "ANDRUIX_POLICY_PATH=/shared/policy/latest/policy.pt" \
   --env "ANDRUIX_REWARD_MODE=raw" \
-  --env "ANDRUIX_REWARD_SCALE=3600000" \
+  --env "ANDRUIX_REWARD_SCALE=1" \
   --env "ANDRUIX_OBS_OCC=1" \
   --env "ANDRUIX_OBS_NO_DOY=0" \
   --env "ANDRUIX_OBS_NO_TREND_15M=0" \
   --env "ANDRUIX_OBS_NO_TREND_60M=0" \
-  --env "ANDRUIX_EXPLORE_NOISE=0.10"
+  --env "ANDRUIX_EXPLORE_NOISE=0.15" \
+  --env ANDRUIX_TERMINAL_END=0
+
+  sudo rm ./shared/policy/latest/* \
+  sudo rm -rf ./shared/rollouts/done/* \
+  sudo rm -rf ./shared/rollouts/inbox/* \
+  sudo rm -rf ./shared/results/*
 
 '''
 
