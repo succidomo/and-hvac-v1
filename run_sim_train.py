@@ -166,9 +166,9 @@ class RLController:
         self._last_outside_temp = None
         self._last_doy = None
         self._last_mod = None
-        self._bucket_oat_sum = None
+        self._bucket_oat_sum = 0.0
         self._bucket_oat_count = 0
-        self._bucket_mean_oat = None
+        self._bucket_mean_oat = 0.0
 
         # ---- Action mapping config ----
         self.sp_center_min_occ = float(sp_center_min_occ)
