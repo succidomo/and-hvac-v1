@@ -531,7 +531,7 @@ def run_one(api: EnergyPlusAPI, *, mode: str, idf: str, epw: str, outdir: str,
     api.runtime.callback_begin_system_timestep_before_predictor(state, ctrl.begin_cb)
     api.runtime.callback_end_system_timestep_after_hvac_reporting(state, ctrl.end_cb)
 
-    eplus_args = ["-w", epw, "-d", outdir, idf]
+    eplus_args = ["-w", str(epw), "-d", str(outdir), str(idf)]
     api.runtime.run_energyplus(state, eplus_args)
 
     metrics = ctrl.finalize()
