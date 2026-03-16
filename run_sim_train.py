@@ -125,7 +125,15 @@ class RLController:
 
         # ---- Control interval (aggregate SystemTimesteps into one RL step) ----
         self.control_minutes = int(control_minutes) if control_minutes else 15
+
+        # reward/accounting bucket (what accumulators belong to)
         self._bucket_id = None
+
+        # action bucket (what held action has been applied for)
+        self._action_bucket_id = None
+
+        # staged boundary info from begin-callback until end-callback closes old bucket
+        self._pending_boundary = None
 
         # bucket accumulators (sum over SystemTimesteps)
         self._bucket_rew = 0.0
@@ -136,6 +144,7 @@ class RLController:
         # minute tracking to avoid over-counting sub-minute callbacks
         self._bucket_last_mod = None
         self._last_uncomfortable = False
+        self._last_occupied = False
 
         # weight for minutes-uncomfortable (env configurable)
         self.uncomfort_min_weight = float(os.environ.get("ANDRUIX_UNCOMFORT_MIN_WEIGHT", "1.0"))
@@ -157,6 +166,9 @@ class RLController:
         self._last_outside_temp = None
         self._last_doy = None
         self._last_mod = None
+        self._bucket_oat_sum = 0.0
+        self._bucket_oat_count = 0
+        self._bucket_mean_oat = 0.0
 
         # ---- Action mapping config ----
         self.sp_center_min_occ = float(sp_center_min_occ)
@@ -617,9 +629,23 @@ class RLController:
 
         return a_norm
 
-    def _write_bucket_timeseries(self, doy: int, mod: int, outside_temp: float, zone_temps: dict[str, float],
-                                reward_sum: float, energy_kwh_sum: float, occupied: bool) -> None:
-        # 1 row per control step (bucket)
+    def _write_bucket_timeseries(
+        self,
+        doy: int,
+        mod: int,
+        outside_temp: float,
+        zone_temps: dict[str, float],
+        reward_sum: float,
+        energy_kwh_sum: float,
+        occupied: bool,
+        held_act: np.ndarray | None = None,
+        held_heat_sp: dict[str, float] | None = None,
+        held_cool_sp: dict[str, float] | None = None,
+    ) -> None:
+        act_vec = self._held_act if held_act is None else held_act
+        heat_map = self._held_heat_sp if held_heat_sp is None else held_heat_sp
+        cool_map = self._held_cool_sp if held_cool_sp is None else held_cool_sp
+
         self.ts_writer.append_step(
             step_idx=int(self.step_count),
             day_of_year=int(doy),
@@ -628,10 +654,63 @@ class RLController:
             hvac_energy_kwh=float(energy_kwh_sum),
             reward=float(reward_sum),
             zone_temps_c={k: float(v) for k, v in zone_temps.items()},
-            zone_setpoints_heat_c={z: float(self._held_heat_sp[z]) for z in self.ZONES if self._held_heat_sp[z] is not None},
-            zone_setpoints_cool_c={z: float(self._held_cool_sp[z]) for z in self.ZONES if self._held_cool_sp[z] is not None},
-            zone_actions_norm={z: float(self._held_act[i]) for i, z in enumerate(self.ZONES)},
+            zone_setpoints_heat_c={z: float(heat_map[z]) for z in self.ZONES if heat_map[z] is not None},
+            zone_setpoints_cool_c={z: float(cool_map[z]) for z in self.ZONES if cool_map[z] is not None},
+            zone_actions_norm={z: float(act_vec[i]) for i, z in enumerate(self.ZONES)},
             extra_scalars={"occupied": 1.0 if occupied else 0.0},
+        )
+
+    def _finalize_bucket(
+        self,
+        next_obs: np.ndarray,
+        next_doy: int,
+        next_mod: int,
+        next_zone_temps: dict[str, float],
+        next_outside_temp: float,
+        next_occupied: bool,
+        prev_act_snapshot: np.ndarray,
+        prev_heat_sp_snapshot: dict[str, float],
+        prev_cool_sp_snapshot: dict[str, float],
+    ) -> None:
+        energy_sum = float(self._bucket_energy_kwh_sum)
+        uncomfort_min = float(self._bucket_uncomfort_min)
+
+        energy_term_bucket = energy_sum / float(self.reward_scale)
+        comfort_term_bucket = float(self.uncomfort_min_weight) * uncomfort_min
+        self._bucket_rew = -energy_term_bucket - comfort_term_bucket
+
+        print(
+            f"[bucket] doy={next_doy} min={next_mod} energy_kwh_sum={energy_sum:.3f} "
+            f"uncomfort_min={uncomfort_min:.1f} reward={self._bucket_rew:.3f} "
+            f"bucket_sys_steps={self._bucket_sys_steps}"
+        )
+
+        if self._prev_obs is not None and self._prev_act is not None:
+            self.rollout_writer.append(
+                obs=self._prev_obs,
+                act=np.asarray(prev_act_snapshot, dtype=np.float32),
+                rew=float(self._bucket_rew),
+                next_obs=np.asarray(next_obs, dtype=np.float32),
+                done=0.0,
+                day_of_year=self._prev_day_of_year,
+                minute_of_day=self._prev_minute_of_day,
+                energy_meter=float(energy_sum),
+                outside_air_c=float(self._bucket_mean_oat),
+            )
+
+        self.step_count += 1
+
+        self._write_bucket_timeseries(
+            next_doy,
+            next_mod,
+            next_outside_temp,
+            next_zone_temps,
+            self._bucket_rew,
+            energy_sum,
+            next_occupied,
+            held_act=np.asarray(prev_act_snapshot, dtype=np.float32),
+            held_heat_sp=prev_heat_sp_snapshot,
+            held_cool_sp=prev_cool_sp_snapshot,
         )
 
     # ---- callbacks ----
@@ -645,6 +724,9 @@ class RLController:
 
         zone_temps = self._read_zone_temps(state)
         outside_temp = self._read_outside_temp(state)
+        self._bucket_oat_sum += outside_temp
+        self._bucket_oat_count += 1
+        self._bucket_mean_oat = self._bucket_oat_sum / max(self._bucket_oat_count, 1)
 
         # store last snapshot for finalize()
         self._last_zone_temps = zone_temps
@@ -664,18 +746,20 @@ class RLController:
         # first ever bucket -> pick initial action
         if self._bucket_id is None:
             self._bucket_id = bucket_id
+            self._action_bucket_id = bucket_id
+
             self._prev_obs = obs
             self._prev_day_of_year = doy
             self._prev_minute_of_day = mod
 
             a_norm = self._select_action_vec(obs)
             self._held_act = a_norm.astype(np.float32)
-            self._prev_act = self._held_act
+            self._prev_act = self._held_act.copy()
             self._apply_action_vec(state, self._held_act, occupied)
             return
 
-        # same bucket -> just re-assert held setpoints (optional safety)
-        if bucket_id == self._bucket_id:
+        # same action bucket -> just re-assert held setpoints
+        if bucket_id == self._action_bucket_id:
             for z in self.ZONES:
                 if self._held_heat_sp[z] is not None:
                     self.api.exchange.set_actuator_value(state, self.heat_sp_handles[z], float(self._held_heat_sp[z]))
@@ -683,60 +767,34 @@ class RLController:
                     self.api.exchange.set_actuator_value(state, self.cool_sp_handles[z], float(self._held_cool_sp[z]))
             return
 
-        # ---- bucket boundary crossed: finalize previous bucket, then choose/apply new action ----
-        energy_sum = float(self._bucket_energy_kwh_sum)
-        uncomfort_min = float(self._bucket_uncomfort_min)
+        # ---- new action bucket reached in BEGIN callback ----
+        # Stage the boundary, but DO NOT finalize/reset reward bucket here.
+        prev_act_snapshot = np.asarray(self._held_act, dtype=np.float32).copy()
+        prev_heat_sp_snapshot = dict(self._held_heat_sp)
+        prev_cool_sp_snapshot = dict(self._held_cool_sp)
 
-        energy_term_bucket = energy_sum / float(self.reward_scale)  # reward_scale is your energy scaling knob
-        comfort_term_bucket = self.uncomfort_min_weight * uncomfort_min
-
-        # if you also want hard-band minutes, you can add another counter similarly later
-        self._bucket_rew = -energy_term_bucket - comfort_term_bucket
-
-        print(
-            f"[bucket] doy={doy} min={mod} energy_kwh_sum={energy_sum:.3f} "
-            f"uncomfort_min={uncomfort_min:.1f} reward={self._bucket_rew:.3f} bucket_sys_steps={self._bucket_sys_steps}"
-        )
-
-        # write replay transition: (prev_obs, prev_act) -> obs with aggregated reward
-        if self._prev_obs is not None and self._prev_act is not None:
-            self.rollout_writer.append(
-                obs=self._prev_obs,
-                act=np.asarray(self._prev_act, dtype=np.float32),
-                rew=self._bucket_rew,
-                next_obs=obs,
-                done=0.0,
-                day_of_year=self._prev_day_of_year,
-                minute_of_day=self._prev_minute_of_day,
-                energy_meter=energy_sum,
-                outside_air_c=float(outside_temp),
-            )
-
-        # control-step index increments once per bucket
-        self.step_count += 1
-
-        # timeseries row for the bucket that just ended (uses boundary temps/time)
-        self._write_bucket_timeseries(doy, mod, outside_temp, zone_temps, self._bucket_rew, energy_sum, occupied)
-
-        # reset bucket accumulators
-        self._bucket_id = bucket_id
-        self._bucket_rew = 0.0
-        self._bucket_energy_kwh_sum = 0.0
-        self._bucket_sys_steps = 0
-        self._bucket_uncomfort_min = 0.0
-        self._bucket_last_mod = int(mod)
-        self._last_uncomfortable = False
-
-        # new action for new bucket
         a_norm = self._select_action_vec(obs)
-        self._held_act = a_norm.astype(np.float32)
-        self._apply_action_vec(state, self._held_act, occupied)
+        new_act = a_norm.astype(np.float32)
 
-        # update “prev” for next transition
-        self._prev_obs = obs
-        self._prev_act = self._held_act
-        self._prev_day_of_year = doy
-        self._prev_minute_of_day = mod
+        # apply the new action immediately for the new bucket
+        self._held_act = new_act.copy()
+        self._apply_action_vec(state, self._held_act, occupied)
+        self._action_bucket_id = bucket_id
+
+        self._pending_boundary = {
+            "bucket_id": int(bucket_id),
+            "obs": np.asarray(obs, dtype=np.float32).copy(),
+            "doy": int(doy),
+            "mod": int(mod),
+            "zone_temps": {k: float(v) for k, v in zone_temps.items()},
+            "outside_temp": float(outside_temp),
+            "occupied": bool(occupied),
+            "new_act": new_act.copy(),
+            "prev_act_snapshot": prev_act_snapshot,
+            "prev_heat_sp_snapshot": prev_heat_sp_snapshot,
+            "prev_cool_sp_snapshot": prev_cool_sp_snapshot,
+        }
+        return
 
     def end_system_timestep_callback(self, state):
         if not self._ensure_ready(state):
@@ -807,6 +865,66 @@ class RLController:
                 f"bucket={self._bucket_id} bucket_rew_sum={self._bucket_rew:.2f}"
             )
 
+        end_bucket_id = self._bucket_from_abs_minute(abs_minute)
+
+        if end_bucket_id != self._bucket_id:
+            pb = self._pending_boundary
+
+            if pb is None or int(pb["bucket_id"]) != int(end_bucket_id):
+                print(
+                    f"[bucket-warn] end bucket advanced to {end_bucket_id} but pending boundary "
+                    f"was missing or mismatched; using current snapshot fallback"
+                )
+
+                pb = {
+                    "bucket_id": int(end_bucket_id),
+                    "obs": self._prev_obs if self._prev_obs is not None else np.zeros((self.obs_dim,), dtype=np.float32),
+                    "doy": int(doy),
+                    "mod": int(mod),
+                    "zone_temps": {k: float(v) for k, v in zone_temps.items()},
+                    "outside_temp": float(outside_temp),
+                    "occupied": bool(occupied),
+                    "new_act": np.asarray(self._held_act, dtype=np.float32).copy(),
+                    "prev_act_snapshot": np.asarray(self._prev_act, dtype=np.float32).copy()
+                        if self._prev_act is not None else np.asarray(self._held_act, dtype=np.float32).copy(),
+                    "prev_heat_sp_snapshot": dict(self._held_heat_sp),
+                    "prev_cool_sp_snapshot": dict(self._held_cool_sp),
+                }
+
+            # finalize old bucket AFTER its last end-of-system-timestep energy has been accumulated
+            self._finalize_bucket(
+                next_obs=pb["obs"],
+                next_doy=pb["doy"],
+                next_mod=pb["mod"],
+                next_zone_temps=pb["zone_temps"],
+                next_outside_temp=pb["outside_temp"],
+                next_occupied=pb["occupied"],
+                prev_act_snapshot=pb["prev_act_snapshot"],
+                prev_heat_sp_snapshot=pb["prev_heat_sp_snapshot"],
+                prev_cool_sp_snapshot=pb["prev_cool_sp_snapshot"],
+            )
+
+            # promote staged new bucket to current reward bucket
+            self._bucket_id = int(end_bucket_id)
+            self._prev_obs = np.asarray(pb["obs"], dtype=np.float32).copy()
+            self._prev_act = np.asarray(pb["new_act"], dtype=np.float32).copy()
+            self._prev_day_of_year = int(pb["doy"])
+            self._prev_minute_of_day = int(pb["mod"])
+
+            # reset accumulators for the new bucket
+            self._bucket_rew = 0.0
+            self._bucket_energy_kwh_sum = 0.0
+            self._bucket_sys_steps = 0
+            self._bucket_uncomfort_min = 0.0
+            self._bucket_last_mod = int(mod)
+            self._last_uncomfortable = bool(uncomfortable_now)
+            self._last_occupied = bool(occupied)
+            self._bucket_mean_oat = 0.0
+            self._bucket_oat_count = 0
+            self._bucket_oat_sum = 0.0
+
+            self._pending_boundary = None
+
     def finalize_and_write_rollout(self):
         """
         Flush the final (possibly partial) bucket.
@@ -871,7 +989,7 @@ class RLController:
                     day_of_year=self._prev_day_of_year,
                     minute_of_day=self._prev_minute_of_day,
                     energy_meter=float(energy_sum),
-                    outside_air_c=float(self._last_outside_temp),
+                    outside_air_c=float(self._bucket_mean_oat),
                 )
 
                 # Mirror the boundary behavior: this was a completed control step
