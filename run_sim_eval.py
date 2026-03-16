@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from typing import Sequence, Optional
 from andruix_policy_model import TorchPolicyModel
+from eplus_runperiod_utils import rewrite_first_runperiod
 
 # ---------- metrics ----------
 @dataclass
@@ -530,7 +531,7 @@ def run_one(api: EnergyPlusAPI, *, mode: str, idf: str, epw: str, outdir: str,
     api.runtime.callback_begin_system_timestep_before_predictor(state, ctrl.begin_cb)
     api.runtime.callback_end_system_timestep_after_hvac_reporting(state, ctrl.end_cb)
 
-    eplus_args = ["-w", epw, "-d", outdir, idf, "--start-date", start_mmdd, "--end-date", end_mmdd]
+    eplus_args = ["-w", epw, "-d", outdir, idf]
     api.runtime.run_energyplus(state, eplus_args)
 
     metrics = ctrl.finalize()
@@ -562,14 +563,23 @@ def main():
     base_out = str(Path(args.outdir) / eval_id / "baseline")
     pol_out  = str(Path(args.outdir) / eval_id / "policy")
 
+    idf_path = Path(args.idf)
+    out_dir = Path(args.eval_root) / eval_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+
+    if args.start_date and args.end_date:
+        idf_path = out_dir / f"runperiod_{args.start_date.replace('/', '-')}_{args.end_date.replace('/', '-')}.idf"
+        rewrite_first_runperiod(Path(args.idf), idf_path, args.start_date, args.end_date)
+
     # TODO: load your Torch policy exactly like training worker does
     policy = load_policy(args.policy_path)
 
-    m_base = run_one(api, mode="baseline", idf=args.idf, epw=args.epw, outdir=base_out,
+    m_base = run_one(api, mode="baseline", idf=idf_path, epw=args.epw, outdir=base_out,
                      zones=zones, energy_meter=args.energy_meter,
                      start_mmdd=args.start_date, end_mmdd=args.end_date, policy=None)
 
-    m_pol  = run_one(api, mode="policy", idf=args.idf, epw=args.epw, outdir=pol_out,
+    m_pol  = run_one(api, mode="policy", idf=idf_path, epw=args.epw, outdir=pol_out,
                      zones=zones, energy_meter=args.energy_meter,
                      start_mmdd=args.start_date, end_mmdd=args.end_date, policy=policy)
 
@@ -588,8 +598,7 @@ def main():
         "savings_pct": safe_div((m_base.energy_kwh - m_pol.energy_kwh), max(1e-6, m_base.energy_kwh)) * 100.0,
     }
 
-    out_dir = Path(args.eval_root) / eval_id
-    out_dir.mkdir(parents=True, exist_ok=True)
+    
     out_path = out_dir / "eval.json"
     out_path.write_text(json.dumps(summary, indent=2))
     print(f"[eval] wrote {out_path}")
